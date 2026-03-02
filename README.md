@@ -1,6 +1,7 @@
 # SoundShare Server
 
 A lightweight Windows console application that captures system audio output and streams it to any browser on the local network via WebSocket, enabling real-time audio sharing without installing any client software.
+Inspired by https://github.com/RegameDesk/sound_share, but implemented back end by myself. This version does not depend on ANY other apps.
 
 ## Features
 
@@ -15,13 +16,13 @@ A lightweight Windows console application that captures system audio output and 
 ## Architecture
 
 ```
-┌─────────────────┐     WebSocket (PCM Int16)     ┌─────────────────┐
+┌─────────────────┐     WebSocket (PCM Int16)      ┌─────────────────┐
 │  Windows PC     │ ──────────────────────────────>│  Browser        │
 │                 │                                │                 │
 │  WASAPI Loopback│     HTTP (Web Page)            │  AudioWorklet   │
-│  → Downmix     │ ──────────────────────────────>│  → Speaker      │
-│  → Resample    │                                │                 │
-│  → PCM Int16   │                                │                 │
+│  → Downmix      │ ──────────────────────────────>│  → Speaker      │
+│  → Resample     │                                │                 │
+│  → PCM Int16    │                                │                 │
 └─────────────────┘                                └─────────────────┘
 ```
 
@@ -53,7 +54,7 @@ SoundShareServer.exe [http_port] [https_port]
 
 ### Prerequisites
 
-- **Visual Studio 2022** (v143 toolset)
+- **Visual Studio 2022** (v143 toolset) or **ABOVE**
 - **vcpkg** (with `VCPKG_ROOT` environment variable set)
 
 ### Install Dependencies
@@ -64,7 +65,7 @@ vcpkg install boost-beast boost-asio openssl --triplet x64-windows
 
 ### Build with Visual Studio
 
-1. Open `SoundShareServer.slnx` in Visual Studio 2022
+1. Open `SoundShareServer.slnx` in Visual Studio 2022 or above
 2. Select **Release | x64** configuration
 3. Build the solution
 
