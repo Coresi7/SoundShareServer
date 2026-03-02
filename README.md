@@ -109,6 +109,9 @@ Tested and working on:
 
 > The client page uses the Web Audio API (`AudioContext` + `AudioWorklet`), which is supported by all modern browsers.
 
+### Known issue for Safari
+- You need to use HTTPS protocol to make this feature works properly. HTTP will fail.
+
 ## Network Requirements
 
 - **Bandwidth**: ~192 KB/s per client (48kHz, stereo, 16-bit PCM)
