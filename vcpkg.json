@@ -1,0 +1,10 @@
+{
+  "name": "soundshare-server",
+  "version": "1.0.0",
+  "description": "Stream PC system audio to browser via WebSocket + PCM",
+  "dependencies": [
+    "boost-beast",
+    "boost-asio",
+    "openssl"
+  ]
+}

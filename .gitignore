@@ -1,0 +1,82 @@
+# =============================================================================
+# SoundShareServer - .gitignore
+# Visual C++ / CMake / vcpkg project
+# =============================================================================
+
+# --- Visual Studio ---
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+*.aps
+
+# --- Build output ---
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]uild/
+[Oo]ut/
+[Bb]in/
+[Ll]ib/
+ARM/
+ARM64/
+
+# --- Compiled files ---
+*.obj
+*.o
+*.lo
+*.slo
+*.pch
+*.gch
+*.ilk
+*.pdb
+*.pgc
+*.pgd
+*.iobj
+*.ipdb
+*.exp
+
+# --- Linker output ---
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.lai
+*.la
+
+# --- CMake ---
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+
+# --- vcpkg ---
+vcpkg_installed/
+
+# --- Misc ---
+*.log
+*.tlog
+*.lastbuildstate
+*.idb
+*.map
+*.d
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+Thumbs.db
+.DS_Store
+desktop.ini

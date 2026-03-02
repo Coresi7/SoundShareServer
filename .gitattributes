@@ -1,0 +1,41 @@
+# =============================================================================
+# SoundShareServer - .gitattributes
+# =============================================================================
+
+# Default: auto-detect text files and normalize line endings
+* text=auto
+
+# --- Source code (always LF) ---
+*.cpp text eol=lf
+*.h   text eol=lf
+*.c   text eol=lf
+*.hpp text eol=lf
+
+# --- Build / config files (always LF for cross-platform) ---
+CMakeLists.txt  text eol=lf
+*.cmake         text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.gitignore     text eol=lf
+*.gitattributes text eol=lf
+
+# --- Windows-specific project files (keep CRLF) ---
+*.sln        text eol=crlf
+*.slnx       text eol=crlf
+*.vcxproj    text eol=crlf
+*.vcxproj.filters text eol=crlf
+*.props      text eol=crlf
+*.targets    text eol=crlf
+
+# --- Binary files (never diff, never merge) ---
+*.exe  binary
+*.dll  binary
+*.lib  binary
+*.pdb  binary
+*.obj  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
