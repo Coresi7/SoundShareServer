@@ -16,14 +16,14 @@ Inspired by https://github.com/RegameDesk/sound_share, but implemented back end 
 ## Architecture
 
 ```
-┌─────────────────┐     WebSocket (PCM Int16)      ┌─────────────────┐
-│  Windows PC     │ ──────────────────────────────>│  Browser        │
-│                 │                                │                 │
-│  WASAPI Loopback│     HTTP (Web Page)            │  AudioWorklet   │
-│  → Downmix      │ ──────────────────────────────>│  → Speaker      │
-│  → Resample     │                                │                 │
-│  → PCM Int16    │                                │                 │
-└─────────────────┘                                └─────────────────┘
+┌─────────────────┐     WebSocket (PCM Int16)      ┌───────────────────────┐
+│  Windows PC     │ ──────────────────────────────>│ Another PC/MAC/Phone's│
+│                 │                                │      Web Browser      │
+│  WASAPI Loopback│     HTTP (Web Page)            │     AudioWorklet      │
+│  → Downmix      │ ──────────────────────────────>│     → Speaker         │
+│  → Resample     │                                │                       │
+│  → PCM Int16    │                                │                       │
+└─────────────────┘                                └───────────────────────┘
 ```
 
 ## Quick Start
