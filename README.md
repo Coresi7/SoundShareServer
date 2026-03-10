@@ -1,7 +1,7 @@
 # SoundShare Server
 
 A lightweight Windows console application that captures system audio output and streams it to any browser on the local network via WebSocket, enabling real-time audio sharing without installing any client software.  
-Inspired by https://github.com/RegameDesk/sound_share, but implemented back end by myself (They didn't provide backend). This version does not depend on ANY apps except your internet browser.
+Inspired by https://github.com/RegameDesk/sound_share, but implemented back end by myself (They didn't provide source code of the backend, use at your own risk). So this version does not depend on **ANY** apps except your web browser.  
 
 ## Features
 
