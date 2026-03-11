@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="SoundShareServer/SoundShareServer.vcxproj" />
+  <Project Path="SoundShareServer/SoundShareServer.vcxproj" Id="92b13ae4-d953-4e36-b759-71a5300bb4a8" />
 </Solution>

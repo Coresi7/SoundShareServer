@@ -15,6 +15,10 @@
 // Callback: receives interleaved float samples, channel count, and sample rate
 using AudioDataCallback = std::function<void(const float* data, uint32_t frameCount, uint32_t channels, uint32_t sampleRate)>;
 
+// Callback: notifies about capture errors and recovery attempts
+// Parameters: errorCode (HRESULT), message, recovered (true if successfully recovered)
+using AudioErrorCallback = std::function<void(long errorCode, const std::string& message, bool recovered)>;
+
 class WasapiCapture {
 public:
     WasapiCapture();
@@ -28,8 +32,13 @@ public:
     uint32_t GetSampleRate() const { return m_sampleRate; }
     uint32_t GetChannels() const { return m_channels; }
 
+    // Set a callback to be notified of capture errors and recovery
+    void SetErrorCallback(AudioErrorCallback callback) { m_errorCallback = std::move(callback); }
+
 private:
     void CaptureThread();
+    void ReleaseDeviceResources();
+    bool ReinitializeDevice();
 
     IMMDeviceEnumerator* m_enumerator = nullptr;
     IMMDevice* m_device = nullptr;
@@ -44,4 +53,10 @@ private:
     std::atomic<bool> m_capturing{ false };
     std::thread m_captureThread;
     AudioDataCallback m_callback;
+    AudioErrorCallback m_errorCallback;
+
+    // Auto-recovery settings
+    static const int MAX_RECOVERY_ATTEMPTS = 10;
+    static const int RECOVERY_WAIT_MS = 2000;     // Wait between retry attempts
+    static const int RECOVERY_BACKOFF_MS = 5000;   // Additional backoff after multiple failures
 };

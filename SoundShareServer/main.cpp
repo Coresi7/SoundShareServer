@@ -127,7 +127,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Set error callback for capture device recovery monitoring
+    capture.SetErrorCallback([](long errorCode, const std::string& message, bool recovered) {
+        if (recovered) {
+            std::cout << "[Audio] " << message << std::endl;
+        } else {
+            std::cerr << "[Audio] " << message
+                      << " (error: 0x" << std::hex << errorCode << std::dec << ")" << std::endl;
+        }
+    });
+
     // Audio output parameters
+
     uint32_t captureRate = capture.GetSampleRate();
     uint32_t captureChannels = capture.GetChannels();
     uint32_t outputRate = 48000;
