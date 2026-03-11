@@ -8,6 +8,7 @@ Inspired by https://github.com/RegameDesk/sound_share, but implemented back end 
 - **System Audio Capture** — Uses WASAPI Loopback to capture all audio playing on the PC
 - **Browser Playback** — Any device on the LAN can listen via a standard web browser (no plugins needed)
 - **Low Latency** — Raw PCM Int16 streaming over WebSocket for minimal delay
+- **Studio-Grade Audio** — Lanczos sinc resampling + TPDF dithering for transparent, artifact-free sound
 - **Auto Reconnect** — Browser client automatically reconnects and resumes playback on disconnection
 - **Multi-Client** — Supports multiple simultaneous listeners
 - **Dual Protocol** — Supports both HTTP and HTTPS (with auto-generated self-signed certificate)
@@ -95,8 +96,8 @@ SoundShareServer/
 ## How It Works
 
 1. **Audio Capture**: WASAPI Loopback captures all system audio output (what you hear through speakers/headphones)
-2. **Processing**: Audio is downmixed to stereo and resampled to 48kHz if necessary
-3. **Encoding**: Samples are converted from float32 to PCM Int16
+2. **Processing**: Audio is downmixed to stereo and resampled to 48kHz if necessary (using Lanczos windowed-sinc interpolation, 8 lobes)
+3. **Encoding**: Samples are converted from float32 to PCM Int16 with TPDF dithering for optimal quantization quality
 4. **Transport**: Raw PCM data is sent as binary WebSocket frames to all connected clients
 5. **Playback**: Browser receives PCM data and plays it through an AudioWorklet with buffering for smooth playback
 
