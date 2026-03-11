@@ -237,7 +237,7 @@ int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
 
     uint16_t httpPort = 8080;
-    uint16_t httpsPort = 0;  // HTTPS disabled by default (no certificate hassle)
+    uint16_t httpsPort = 8443;  // HTTPS enabled by default on 8443
     if (argc > 1) {
         httpPort = static_cast<uint16_t>(std::atoi(argv[1]));
     }

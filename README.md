@@ -32,8 +32,8 @@ Inspired by https://github.com/RegameDesk/sound_share, but implemented back end 
 ### Pre-built Binary
 
 1. Download `SoundShareServer.exe` from [Releases](../../releases)
-2. Run it — the server starts on HTTP port **8080** by default
-3. On another device, open `http://<server-ip>:8080/` in a browser
+2. Run it — 默认启动 HTTP 端口 **8080** 和 HTTPS 端口 **8443**
+3. 在另一台设备上，浏览器打开 `http://<server-ip>:8080/` 或 `https://<server-ip>:8443/`
 4. Click **Start** to begin listening
 
 ### Command Line Options
@@ -44,10 +44,10 @@ SoundShareServer.exe [http_port] [https_port]
 
 | Example | Description |
 |---------|-------------|
-| `SoundShareServer.exe` | HTTP on port 8080 (default) |
-| `SoundShareServer.exe 9090` | HTTP on port 9090 |
-| `SoundShareServer.exe 8080 8443` | HTTP on 8080 + HTTPS on 8443 |
-| `SoundShareServer.exe 0 8443` | HTTPS only on 8443 |
+| `SoundShareServer.exe` | HTTP 8080 + HTTPS 8443（默认） |
+| `SoundShareServer.exe 9090` | HTTP 9090 + HTTPS 8443 |
+| `SoundShareServer.exe 8080 0` | 仅 HTTP 8080（禁用 HTTPS） |
+| `SoundShareServer.exe 0 8443` | 仅 HTTPS 8443（禁用 HTTP） |
 
 > **Note:** HTTPS mode auto-generates a self-signed certificate. You will need to accept the browser security warning on first visit.
 
