@@ -65,6 +65,10 @@ CMakeUserPresets.json
 # --- vcpkg ---
 vcpkg_installed/
 
+# --- Harness / local docs (not tracked) ---
+docs/
+logs/
+
 # --- Misc ---
 *.log
 *.tlog
