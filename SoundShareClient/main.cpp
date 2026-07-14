@@ -125,6 +125,7 @@ int main(int argc, char* argv[]) {
         }
 
         configReceived.store(true);
+        ringBuffer.Clear();  // Clear any stale data from previous session/idle period
         renderer.SetRingBuffer(&ringBuffer);
         if (!renderer.Initialize(sampleRate, static_cast<uint16_t>(channels))) {
             std::cerr << "[Client] Failed to init renderer" << std::endl;
@@ -157,44 +158,84 @@ int main(int argc, char* argv[]) {
         ringBuffer.Push(samples, size / sizeof(int16_t));
     });
 
-    std::cout << "[Client] Connecting..." << std::endl;
-    if (!client.Connect(host, port)) {
-        std::cerr << "[Client] Connection failed" << std::endl;
-        return 2;
-    }
-    std::cout << "[Client] Connected" << std::endl;
+    // Retry loop: auto-reconnect on disconnection (same behavior as browser client).
+    // WebSocket keep-alive pings (configured server-side) handle NAT/firewall idle timeouts.
+    int reconnectAttempt = 0;
+    constexpr int kMaxReconnectDelay = 30000; // cap backoff at 30s
 
-    if (!client.SendText(R"({"type":"start"})")) {
-        std::cerr << "[Client] Failed to send start" << std::endl;
+    while (g_running.load()) {
+        reconnectAttempt++;
+
+        std::cout << "[Client] Connecting..." << std::endl;
+        if (!client.Connect(host, port)) {
+            std::cerr << "[Client] Connection failed" << std::endl;
+            if (!g_running.load()) break;
+            int delay = std::min(1000 * reconnectAttempt, kMaxReconnectDelay);
+            std::cout << "[Client] Retrying in " << (delay / 1000) << "s..." << std::endl;
+            for (int waited = 0; waited < delay && g_running.load(); waited += 100) {
+                Sleep(100);
+            }
+            continue;
+        }
+        std::cout << "[Client] Connected" << std::endl;
+
+        if (!client.SendText(R"({"type":"start"})")) {
+            std::cerr << "[Client] Failed to send start" << std::endl;
+            client.Disconnect();
+            if (!g_running.load()) break;
+            int delay = std::min(1000 * reconnectAttempt, kMaxReconnectDelay);
+            std::cout << "[Client] Retrying in " << (delay / 1000) << "s..." << std::endl;
+            for (int waited = 0; waited < delay && g_running.load(); waited += 100) {
+                Sleep(100);
+            }
+            continue;
+        }
+
+        // Reset reconnect backoff on successful connection
+        reconnectAttempt = 0;
+
+        // Wait for audio_config (timeout 10s)
+        configReceived.store(false);
+        for (int i = 0; i < 100 && g_running.load() && !configReceived.load(); i++) {
+            Sleep(100);
+        }
+        if (!configReceived.load()) {
+            std::cerr << "[Client] Timeout waiting for audio_config" << std::endl;
+            client.SendText(R"({"type":"stop"})");
+            client.Disconnect();
+            if (!g_running.load()) break;
+            std::cout << "[Client] Reconnecting in 1s..." << std::endl;
+            for (int waited = 0; waited < 1000 && g_running.load(); waited += 100) {
+                Sleep(100);
+            }
+            continue;
+        }
+
+        // Main streaming loop — wait until disconnected or Ctrl+C
+        while (g_running.load() && client.IsConnected()) {
+            Sleep(100);
+        }
+
+        streaming.store(false);
+        if (playbackStarted.load()) {
+            renderer.Stop();
+            playbackStarted.store(false);
+        }
+
+        if (client.IsConnected()) {
+            client.SendText(R"({"type":"stop"})");
+        }
+        client.RequestStop();
         client.Disconnect();
-        return 2;
-    }
 
-    // Wait for audio_config (timeout 10s)
-    for (int i = 0; i < 100 && g_running.load() && !configReceived.load(); i++) {
-        Sleep(100);
-    }
-    if (!configReceived.load()) {
-        std::cerr << "[Client] Timeout waiting for audio_config" << std::endl;
-        client.SendText(R"({"type":"stop"})");
-        client.Disconnect();
-        return 3;
-    }
+        if (!g_running.load()) break;
 
-    while (g_running.load() && client.IsConnected()) {
-        Sleep(100);
+        // Disconnected unexpectedly — reconnect
+        std::cout << "[Client] Connection lost. Reconnecting in 1s..." << std::endl;
+        for (int waited = 0; waited < 1000 && g_running.load(); waited += 100) {
+            Sleep(100);
+        }
     }
-
-    streaming.store(false);
-    if (playbackStarted.load()) {
-        renderer.Stop();
-    }
-
-    if (client.IsConnected()) {
-        client.SendText(R"({"type":"stop"})");
-    }
-    client.RequestStop();
-    client.Disconnect();
 
     int code = g_exitCode.load();
     if (code == 0 && !g_running.load()) {

@@ -234,7 +234,7 @@ PlainWebSocketSession::~PlainWebSocketSession() {
 void PlainWebSocketSession::Run(http::request<http::string_body> req) {
     websocket::stream_base::timeout opt{};
     opt.handshake_timeout = std::chrono::seconds(30);
-    opt.idle_timeout = std::chrono::seconds(300);
+    opt.idle_timeout = std::chrono::seconds(120);
     opt.keep_alive_pings = true;
 
     m_ws.set_option(opt);
@@ -343,7 +343,7 @@ SslWebSocketSession::~SslWebSocketSession() {
 void SslWebSocketSession::Run(http::request<http::string_body> req) {
     websocket::stream_base::timeout opt{};
     opt.handshake_timeout = std::chrono::seconds(30);
-    opt.idle_timeout = std::chrono::seconds(300);
+    opt.idle_timeout = std::chrono::seconds(120);
     opt.keep_alive_pings = true;
 
     m_ws.set_option(opt);
