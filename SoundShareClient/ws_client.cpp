@@ -26,7 +26,17 @@ bool WsClient::Connect(const std::string& host, uint16_t port) {
         stream.connect(results);
 
         m_ws = std::make_unique<websocket::stream<beast::tcp_stream>>(std::move(stream));
-        m_ws->set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+
+        // Match server-side timeout settings so the client doesn't time out
+        // before the server's keep-alive pings arrive.  Beast's suggested(client)
+        // uses a 23s idle timeout with no pings — far too short when the system
+        // has no active audio (WASAPI produces no packets, connection goes idle).
+        websocket::stream_base::timeout wsTimeout{};
+        wsTimeout.handshake_timeout = std::chrono::seconds(30);
+        wsTimeout.idle_timeout = std::chrono::seconds(120);
+        wsTimeout.keep_alive_pings = true;
+        m_ws->set_option(wsTimeout);
+
         m_ws->set_option(websocket::stream_base::decorator(
             [](websocket::request_type& req) {
                 req.set(http::field::user_agent, "SoundShareClient/1.0");
