@@ -41,6 +41,8 @@ inline const char* GetIndexHtml() {
         .status.connected { background: #0f3460; color: #4ecca3; }
         .status.disconnected { background: #3a0000; color: #e94560; }
         .status.streaming { background: #1a4a1a; color: #4ecca3; }
+        /* C1 (FR-09): stall state */
+        .status.stalled { background: #4a3a00; color: #ffcc4e; }
         button {
             padding: 12px 32px;
             font-size: 18px;
@@ -155,7 +157,11 @@ let isStreaming = false;
 let wasStreaming = false;  // Track if we were streaming before disconnect (for auto-resume)
 let sampleRate = 48000;
 let channels = 2;
-let packetCount = 0;
+/* C2 (FR-09 / SS5.11): browser stall watchdog state */
+let lastPcmAt = 0;
+let pcmArmed = false;
+let stallTimer = null;
+const BROWSER_STALL_MS = 15000;   // T_browser_stall (SS11-1)
 
 function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -169,7 +175,6 @@ function connect() {
         if (wasStreaming && audioCtx && (workletNode || scriptNode)) {
             console.log('[WS] Reconnected, auto-resuming stream...');
             isStreaming = true;
-            packetCount = 0;
             // Clear stale audio data in worklet buffer
             if (workletNode) {
                 workletNode.port.postMessage({ type: 'clear' });
@@ -218,18 +223,56 @@ function connect() {
                 }
             } catch(e) {}
         } else if (evt.data instanceof ArrayBuffer && isStreaming) {
+            // C3 (B-1 arming): arm the watchdog only after the FIRST PCM frame
+            lastPcmAt = performance.now();
+            if (!pcmArmed) {
+                pcmArmed = true;
+                startStallWatchdog();
+            }
             handlePCMData(evt.data);
         }
     };
 }
 
+/* ---- C5 (FR-09): stall watchdog ---- */
+function startStallWatchdog() {
+    if (stallTimer !== null) clearInterval(stallTimer);
+    stallTimer = setInterval(checkStall, 1000);
+}
+
+function checkStall() {
+    // Judgement: streaming + armed + no PCM for BROWSER_STALL_MS (SS5.11)
+    if (!(isStreaming && pcmArmed)) return;
+    if (performance.now() - lastPcmAt < BROWSER_STALL_MS) return;
+    handleStall();
+}
+
+/* ---- C6: stall action -> reuse existing onclose reconnect loop (D-08) ---- */
+function handleStall() {
+    // 1. one error line (E-BROWSER-STALL, SS6.4)
+    console.error('[WS] audio stalled: no PCM for ' +
+                  Math.round(performance.now() - lastPcmAt) + 'ms, reconnecting');
+    // 2. UI
+    const status = document.getElementById('status');
+    status.className = 'status stalled';
+    status.textContent = 'Audio stalled. Reconnecting...';
+    // 3. disarm
+    isStreaming = false;
+    wasStreaming = true;
+    pcmArmed = false;
+    if (stallTimer !== null) { clearInterval(stallTimer); stallTimer = null; }
+    // 4. reconnect via existing onclose -> setTimeout(connect,1000) -> onopen auto-start
+    try {
+        ws.close();
+    } catch (err) {
+        setTimeout(connect, 1000);
+    }
+}
+
 function handlePCMData(arrayBuffer) {
     if (!workletNode) return;
 
-    packetCount++;
-    if (packetCount % 500 === 1) {
-        console.log('[WS] PCM packet #' + packetCount + ' bytes=' + arrayBuffer.byteLength);
-    }
+    // C9 (M-10): every-500-packet console.log removed (high-frequency noise).
 
     // Data is Int16 interleaved PCM from server
     // Convert Int16 -> Float32 for AudioWorklet
@@ -283,9 +326,9 @@ async function startAudio() {
         initScriptProcessorFallback();
     }
 
-    packetCount = 0;
     isStreaming = true;
     ws.send(JSON.stringify({ type: 'start' }));
+    lastPcmAt = performance.now();   // C4: reset baseline; NOT armed yet (B-1)
 
     wasStreaming = true;  // Mark that user wants streaming
     document.getElementById('startBtn').disabled = true;
@@ -327,10 +370,7 @@ function initScriptProcessorFallback() {
     // Override handlePCMData for fallback mode
     window._originalHandlePCM = handlePCMData;
     handlePCMData = function(arrayBuffer) {
-        packetCount++;
-        if (packetCount % 500 === 1) {
-            console.log('[WS-FB] PCM packet #' + packetCount + ' bytes=' + arrayBuffer.byteLength);
-        }
+        // C10 (M-10): every-500-packet console.log removed (high-frequency noise).
         const int16 = new Int16Array(arrayBuffer);
         for (let i = 0; i < int16.length; i++) {
             fallbackBuffer.push(int16[i] / 32768.0);
@@ -346,6 +386,9 @@ function initScriptProcessorFallback() {
 function stopAudio() {
     isStreaming = false;
     wasStreaming = false;  // User explicitly stopped, do not auto-resume
+    // C8 (FR-09): disarm stall watchdog
+    pcmArmed = false;
+    if (stallTimer !== null) { clearInterval(stallTimer); stallTimer = null; }
 
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'stop' }));
@@ -382,6 +425,12 @@ function setVolume(val) {
         gainNode.gain.value = val / 100.0;
     }
 }
+
+/* C7 (R-07): compensate background-tab setInterval throttling -- re-check
+   immediately when the tab becomes visible again. */
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) checkStall();
+});
 
 connect();
 </script>

@@ -145,11 +145,14 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="wasapi_capture.cpp" />
     <ClCompile Include="http_server.cpp" />
+    <ClCompile Include="diagnostics.cpp" />
 
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="wasapi_capture.h" />
     <ClInclude Include="http_server.h" />
+    <ClInclude Include="diagnostics.h" />
+    <ClInclude Include="write_queue.h" />
 
     <ClInclude Include="embedded_page.h" />
   </ItemGroup>

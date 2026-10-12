@@ -77,6 +77,19 @@ int main(int argc, char* argv[]) {
 
     std::string host = argv[1];
     uint16_t port = 8080;
+
+    // B13 (FR-05/NFR-WIN-4): --fault-render-fail=<padding|getbuffer|releasebuffer>
+    // Application-level render-failure injection for AC-07; default off.
+    std::string faultStage;
+    {
+        const std::string kPrefix = "--fault-render-fail=";
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg.rfind(kPrefix, 0) == 0) {
+                faultStage = arg.substr(kPrefix.size());
+            }
+        }
+    }
     if (argc >= 3) {
         char* end = nullptr;
         unsigned long p = std::strtoul(argv[2], &end, 10);
@@ -100,6 +113,21 @@ int main(int argc, char* argv[]) {
 
     WasapiRender renderer;
     WsClient client;
+
+    if (!faultStage.empty()) {
+        if (faultStage != "padding" && faultStage != "getbuffer" && faultStage != "releasebuffer") {
+            std::cerr << "Invalid --fault-render-fail stage: " << faultStage
+                      << " (expected padding|getbuffer|releasebuffer)" << std::endl;
+            return 1;
+        }
+        renderer.SetFaultInjectStage(faultStage);
+        std::cout << "[Audio] Fault injection enabled: render stage '" << faultStage << "'" << std::endl;
+    }
+
+    // B11 (M-6): stall handler runs on the IO thread; only flag-setting /
+    // logging allowed. The E-CLIENT-STALL line is printed inside WsClient
+    // (once per stall); teardown is done by the main loop polling IsStalled().
+    client.SetStallHandler([](uint64_t /*silentMs*/) {});
 
     std::atomic<bool> configReceived{false};
     std::atomic<bool> playbackStarted{false};
@@ -211,8 +239,19 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Main streaming loop — wait until disconnected or Ctrl+C
-        while (g_running.load() && client.IsConnected()) {
+        // Main streaming loop — exit on: Ctrl+C / disconnect / audio stall /
+        // render-thread death (B12, FR-08/FR-11).
+        while (g_running.load() && client.IsConnected() && !client.IsStalled()) {
+            // FR-11 / SS5.12: render thread exited abnormally -> surface as a
+            // recoverable error, fall through to the existing reconnect +
+            // renderer rebuild loop (E-CLIENT-RENDER-EXIT, one line).
+            if (playbackStarted.load() && !renderer.IsRunning()) {
+                std::cerr << "[Audio][ERROR] render thread exited: stage="
+                          << renderer.GetExitStageName()
+                          << " hr=0x" << std::hex << renderer.GetExitHr() << std::dec
+                          << " (" << renderer.GetLastError() << ")" << std::endl;
+                break;
+            }
             Sleep(100);
         }
 

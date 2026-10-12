@@ -1,7 +1,16 @@
 #include "ws_client.h"
 
+#include <chrono>
 #include <future>
 #include <iostream>
+
+namespace {
+uint64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
 
 WsClient::WsClient() = default;
 
@@ -15,6 +24,14 @@ bool WsClient::Connect(const std::string& host, uint16_t port) {
     m_host = host;
     m_port = port;
     m_stopRequested.store(false);
+
+    // ---- B14 (M-6): authoritative stall-state reset point ----
+    // Runs BEFORE the io_context is created below. Invariant: after Connect()
+    // returns and until the next stall detection, IsStalled() is false, so the
+    // reconnected main loop will not exit immediately due to a stale flag.
+    m_stalled.store(false);
+    m_armed.store(false);
+    m_lastBinaryMs.store(NowMs());
 
     try {
         m_ioc = std::make_unique<net::io_context>();
@@ -63,6 +80,7 @@ bool WsClient::Connect(const std::string& host, uint16_t port) {
 
 void WsClient::IoThreadMain() {
     DoRead();
+    StartWatchdog();   // B3 (SS5.10.2): watchdog timer on the same io_context
     try {
         m_ioc->run();
     } catch (const std::exception& ex) {
@@ -106,6 +124,10 @@ void WsClient::OnRead(beast::error_code ec, std::size_t bytes) {
             m_onBinary(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
         }
         m_buffer.consume(bytes);
+        // B4 (B-1 arming condition): armed only after the FIRST binary frame.
+        // Do NOT clear m_stalled here -- resets are owned by Connect/Disconnect (M-6).
+        m_lastBinaryMs.store(NowMs());
+        m_armed.store(true);
     }
 
     DoRead();
@@ -155,7 +177,14 @@ void WsClient::Disconnect() {
     }
 
     m_ws.reset();
+    m_watchdog.reset();   // timer object dies with the io_context
     m_ioc.reset();
+
+    // ---- B5 (M-6): second stall-state reset point ----
+    // Both reset points (Connect entry / Disconnect end) run on the main
+    // thread path -- no concurrency between them.
+    m_stalled.store(false);
+    m_armed.store(false);
 }
 
 void WsClient::Fail(const std::string& reason) {
@@ -163,4 +192,35 @@ void WsClient::Fail(const std::string& reason) {
     std::cerr << "[WS] " << reason << std::endl;
     if (m_onError) m_onError(reason);
     m_connected.store(false);
+}
+
+// ---- B3: stall watchdog (SS5.10) ----
+void WsClient::StartWatchdog() {
+    if (!m_ioc) return;
+    m_watchdog = std::make_unique<net::steady_timer>(*m_ioc);
+    m_watchdog->expires_after(std::chrono::seconds(1));
+    m_watchdog->async_wait([this](beast::error_code ec) { OnWatchdogTick(ec); });
+}
+
+void WsClient::OnWatchdogTick(beast::error_code ec) {
+    if (ec == net::error::operation_aborted) return;
+    if (!m_connected.load() || m_stopRequested.load()) return;
+
+    const uint64_t now = NowMs();
+    const uint64_t last = m_lastBinaryMs.load();
+    if (m_armed.load() && now > last && (now - last) >= m_stallMs) {
+        // SS5.10.3: act only on the false->true transition (one log line max);
+        // NEVER touch the connection from this io thread (D-10 B / M-6).
+        if (!m_stalled.exchange(true)) {
+            const uint64_t silent = now - last;
+            std::cerr << "[Client][ERROR] audio stall: no PCM for " << silent
+                      << "ms (threshold " << m_stallMs << "ms), reconnecting"
+                      << std::endl;   // E-CLIENT-STALL (SS6.4)
+            if (m_onStall) m_onStall(silent);
+        }
+        return;   // stop ticking; main loop tears down via IsStalled()
+    }
+
+    m_watchdog->expires_after(std::chrono::seconds(1));
+    m_watchdog->async_wait([this](beast::error_code e) { OnWatchdogTick(e); });
 }

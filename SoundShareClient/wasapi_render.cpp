@@ -18,6 +18,35 @@ WasapiRender::~WasapiRender() {
     Stop();
 }
 
+const char* WasapiRender::GetExitStageName() const {
+    switch (m_exitStage.load()) {
+    case 1: return "GetCurrentPadding";
+    case 2: return "GetBuffer";
+    case 3: return "ReleaseBuffer";
+    default: return "none";
+    }
+}
+
+// B7/B8/B9: application-level fault injection check (default: stage empty = off)
+bool WasapiRender::FaultHit(int stage) const {
+    if (m_faultStage.empty()) return false;
+    switch (stage) {
+    case 1: return m_faultStage == "padding";
+    case 2: return m_faultStage == "getbuffer";
+    case 3: return m_faultStage == "releasebuffer";
+    default: return false;
+    }
+}
+
+void WasapiRender::RecordExit(int stage, HRESULT hr) {
+    m_exitStage.store(stage);
+    m_exitHr.store(hr);
+    // Filled on the render thread, read by the main thread after IsRunning()
+    // flips to false (ordering via the atomic flag) -- same pattern as the
+    // existing m_lastError usage in Start().
+    m_lastError = std::string("render thread exited: stage=") + GetExitStageName();
+}
+
 bool WasapiRender::Initialize(uint32_t sampleRate, uint16_t channels) {
     m_sampleRate = sampleRate;
     m_channels = channels;
@@ -228,14 +257,16 @@ void WasapiRender::RenderLoop() {
 
         UINT32 padding = 0;
         hr = audioClient->GetCurrentPadding(&padding);
-        if (FAILED(hr)) break;
+        // B7: FAILED or --fault-render-fail=padding -> record & break (FR-11)
+        if (FAILED(hr) || FaultHit(1)) { RecordExit(1, hr); break; }
 
         UINT32 availableFrames = m_bufferFrameCount - padding;
         if (availableFrames == 0) continue;
 
         BYTE* data = nullptr;
         hr = renderClient->GetBuffer(availableFrames, &data);
-        if (FAILED(hr)) break;
+        // B8: FAILED or --fault-render-fail=getbuffer -> record & break (FR-11)
+        if (FAILED(hr) || FaultHit(2)) { RecordExit(2, hr); break; }
 
         size_t samplesNeeded = static_cast<size_t>(availableFrames) * channels;
         size_t got = m_ringBuffer->Pop(temp.data(), samplesNeeded);
@@ -246,7 +277,8 @@ void WasapiRender::RenderLoop() {
         std::memcpy(data, temp.data(), samplesNeeded * sizeof(int16_t));
 
         hr = renderClient->ReleaseBuffer(availableFrames, 0);
-        if (FAILED(hr)) break;
+        // B9: FAILED or --fault-render-fail=releasebuffer -> record & break (FR-11)
+        if (FAILED(hr) || FaultHit(3)) { RecordExit(3, hr); break; }
     }
 
     audioClient->Stop();

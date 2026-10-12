@@ -19,6 +19,7 @@
 #include <set>
 #include <atomic>
 #include <csignal>
+#include <cctype>
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -305,6 +306,10 @@ int main(int argc, char* argv[]) {
     // Start HTTP/WebSocket server
     auto server = std::make_shared<HttpServer>(httpPort, httpsPort);
 
+    // Debug counters（A23/A24：保留为原子计数器，仅由探针读取，不再打印日志）
+    std::atomic<uint64_t> captureCallbackCount{0};
+    std::atomic<uint64_t> sentPacketCount{0};
+
     // Track which sessions are "streaming" (have sent start)
     std::mutex streamingMutex;
     std::set<WebSocketSessionBase*> streamingSessions;
@@ -313,6 +318,9 @@ int main(int argc, char* argv[]) {
 
     server->SetConnectCallback([&](WebSocketSessionBase* session, bool connected) {
         if (!connected) {
+            // 注意（A28b 偏离说明）：此处只 erase，不调用 session->SetStreaming(false)——
+            // 该回调可能由会话析构函数触发（析构中虚调用 = UB / 纯虚崩溃），
+            // 且对象即将消亡，streaming 标志随对象消亡无意义。
             std::lock_guard<std::mutex> lock(streamingMutex);
             streamingSessions.erase(session);
             hasStreamingClients.store(!streamingSessions.empty());
@@ -331,15 +339,29 @@ int main(int argc, char* argv[]) {
 
                 std::lock_guard<std::mutex> lock(streamingMutex);
                 streamingSessions.insert(session);
+                session->SetStreaming(true);   // A28b：探针流状态标记
                 hasStreamingClients.store(true);
-                std::cout << "[Audio] Client started streaming. Active: " << streamingSessions.size() << std::endl;
             } else if (msg.find("\"stop\"") != std::string::npos) {
                 std::lock_guard<std::mutex> lock(streamingMutex);
                 streamingSessions.erase(session);
+                session->SetStreaming(false);  // A28b：对象存活（消息回调中），安全
                 hasStreamingClients.store(!streamingSessions.empty());
-                std::cout << "[Audio] Client stopped streaming. Active: " << streamingSessions.size() << std::endl;
             }
         } catch (...) {}
+    });
+
+    // A28: 探针 hook —— 返回顶层 JSON 成员序列（不含外层大括号）。
+    // ★ 硬约束（§5.8.4）：本 hook 由 DumpProbeJson() 在【释放 L1 之后】调用，
+    //   内部持 L2 只取 count 与计数器、立即出锁后序列化 —— 严禁 L1→L2 嵌套。
+    server->SetProbeHook([&]() -> std::string {
+        size_t streamingCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(streamingMutex);
+            streamingCount = streamingSessions.size();
+        }
+        return "\"streaming\": { \"count\": " + std::to_string(streamingCount) + " },"
+               " \"captureCallbacks\": " + std::to_string(captureCallbackCount.load()) + ","
+               " \"sentPackets\": " + std::to_string(sentPacketCount.load());
     });
 
     if (!server->Start()) {
@@ -360,21 +382,13 @@ int main(int argc, char* argv[]) {
     std::cout << "Press Ctrl+C to stop." << std::endl;
     std::cout << std::endl;
 
-    // Debug counters
-    std::atomic<uint64_t> captureCallbackCount{0};
-    std::atomic<uint64_t> sentPacketCount{0};
-
     // Start audio capture - send raw PCM Int16 directly
     capture.Start([&](const float* data, uint32_t frameCount, uint32_t channels, uint32_t sampleRate) {
         if (!hasStreamingClients.load()) return;
 
-        uint64_t cbCount = captureCallbackCount.fetch_add(1) + 1;
-        if (cbCount == 1 || cbCount % 500 == 0) {
-            std::cout << "[Audio] Capture callback #" << cbCount
-                      << " frames=" << frameCount
-                      << " ch=" << channels
-                      << " rate=" << sampleRate << std::endl;
-        }
+        // A23 (FR-03/NFR-LOG-1): periodic "[Audio] Capture callback #N" log removed;
+        // counter kept as atomic, read only by the probe (A28).
+        captureCallbackCount.fetch_add(1);
 
         // Downmix to outputChannels if needed
         std::vector<float> processed;
@@ -428,15 +442,36 @@ int main(int argc, char* argv[]) {
             for (auto* session : streamingSessions) {
                 try {
                     session->SendBinary(pcm16.data(), pcm16.size() * sizeof(int16_t));
-                    uint64_t sCount = sentPacketCount.fetch_add(1) + 1;
-                    if (sCount == 1 || sCount % 500 == 0) {
-                        std::cout << "[Audio] Sent PCM packet #" << sCount
-                                  << " (" << pcm16.size() * sizeof(int16_t) << " bytes)" << std::endl;
-                    }
+                    // A24 (FR-03/NFR-LOG-1): periodic "[Audio] Sent PCM packet #N" log
+                    // removed; counter kept as atomic, read only by the probe (A28).
+                    sentPacketCount.fetch_add(1);
                 } catch (...) {}
             }
         }
     });
+
+    // A27: stdin "dump" 探针入口（入口 2/3）——独立线程读 stdin，收到
+    // dump / p / probe（大小写不敏感）时向 stdout 打印一次探针 JSON。
+    // 不阻塞主循环；detach 线程只做 cout，进程退出时随进程终止。
+    {
+        auto serverCopy = server;  // shared_ptr 副本，避免 main 栈帧悬垂
+        std::thread stdinThread([serverCopy]() {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                std::string t;
+                t.reserve(line.size());
+                for (char c : line) {
+                    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                        t += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    }
+                }
+                if (t == "dump" || t == "p" || t == "probe") {
+                    std::cout << serverCopy->DumpProbeJson() << std::endl;
+                }
+            }
+        });
+        stdinThread.detach();
+    }
 
     // Main loop - wait for Ctrl+C
     while (g_running.load()) {
