@@ -46,6 +46,38 @@ def summary(p):
         % (p.get("streaming", {}).get("count"), c["sessions"], c["liveSessions"],
            c["forceClosed"], c["writeStalls"], p.get("captureCallbacks"),
            p.get("sentPackets")))
+    # T-GPU-AUDIO-GLITCH S0 (F6): capture observation line (02-design.md §6.4).
+    # Appended only — existing output lines unchanged (backward compatible).
+    # Missing keys (older server builds) render as "n/a".
+    if any(k in p for k in ("captureDiscontinuityCount", "captureInterArrivalMsP99")):
+        inj = p.get("injection", {}) or {}
+        lines.append(
+            "  capture: D=%s interArrival P50/P99/Max=%s/%s/%s n=%s sat=%s"
+            % (p.get("captureDiscontinuityCount", "n/a"),
+               p.get("captureInterArrivalMsP50", "n/a"),
+               p.get("captureInterArrivalMsP99", "n/a"),
+               p.get("captureInterArrivalMsMax", "n/a"),
+               p.get("captureInterArrivalSamples", "n/a"),
+               p.get("captureInterArrivalSaturated", "n/a")))
+        lines.append(
+            "         C P50/P99=%s/%s n=%s buf=%sf(%shns) mmcss=%s evt=%s handles=%s "
+            "evtTimeout=%s wakes=%s reinit=%s"
+            % (p.get("captureCallbackCriticalMsP50", "n/a"),
+               p.get("captureCallbackCriticalMsP99", "n/a"),
+               p.get("captureCallbackCriticalSamples", "n/a"),
+               p.get("captureBufferFrames", "n/a"), p.get("captureBufferHns", "n/a"),
+               p.get("captureMmcssRegistered", "n/a"), p.get("captureEventDriven", "n/a"),
+               p.get("captureEventHandlesCreated", "n/a"),
+               p.get("captureEventTimeouts", "n/a"),
+               p.get("captureEventWakes", "n/a"),
+               p.get("captureReinitCount", "n/a")))
+        lines.append(
+            "         endpoint=%s(gpu=%s) markerSeq=%s inject=(stall=%s/%s, batch=%s, skip=%s)"
+            % (p.get("captureEndpointName", "n/a"),
+               p.get("captureEndpointIsGpuAudio", "n/a"),
+               p.get("markerSeq", "n/a"),
+               inj.get("captureStallMs", "n/a"), inj.get("captureStallProbPpm", "n/a"),
+               inj.get("captureBatchMs", "n/a"), inj.get("captureSkipPackets", "n/a")))
     return "\n".join(lines)
 
 

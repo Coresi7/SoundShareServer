@@ -75,8 +75,51 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string host = argv[1];
+    std::string host;
     uint16_t port = 8080;
+
+    // T-GPU-AUDIO-GLITCH F4 (FR-05)：水位参数族（NFR-LAT-2 单一参数族）。
+    // start 默认 80ms（区间 [60,120]）；resume = 0.75×start（滞回防振荡）；
+    // 容量上限 capacityCap = kRingCapacity 维持 2s 不变（不得提高）。
+    constexpr uint32_t kDefaultStartWaterMs = 80;
+    uint32_t startWaterMs = kDefaultStartWaterMs;
+    std::string dumpPcmPath;   // C1：--dump-pcm=<path>（默认关闭）
+
+    // 位置参数只认非 "--" 开关（与既有 <ip> [port] 语义兼容）
+    {
+        const std::string kWaterPrefix = "--start-water-ms=";
+        const std::string kDumpPrefix = "--dump-pcm=";
+        const std::string kFaultPrefix = "--fault-render-fail=";
+        int positional = 0;
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg.rfind(kWaterPrefix, 0) == 0) {
+                char* end = nullptr;
+                const long ms = std::strtol(arg.c_str() + kWaterPrefix.size(), &end, 10);
+                if (end && *end == '\0' && ms >= 60 && ms <= 120) {
+                    startWaterMs = static_cast<uint32_t>(ms);
+                } else {
+                    std::cout << "[Audio] Ignoring invalid " << arg
+                              << " (expected --start-water-ms=<60..120>); using default "
+                              << kDefaultStartWaterMs << " ms" << std::endl;
+                }
+            } else if (arg.rfind(kDumpPrefix, 0) == 0) {
+                dumpPcmPath = arg.substr(kDumpPrefix.size());
+            } else if (arg.rfind(kFaultPrefix, 0) == 0) {
+                // handled below (kept for positional-skip parity)
+            } else if (arg.rfind("--", 0) == 0) {
+                // unknown switch: skip from positional parsing
+            } else {
+                ++positional;
+                if (positional == 1) host = arg;
+            }
+        }
+    }
+
+    if (host.empty()) {
+        PrintUsage();
+        return 1;
+    }
 
     // B13 (FR-05/NFR-WIN-4): --fault-render-fail=<padding|getbuffer|releasebuffer>
     // Application-level render-failure injection for AC-07; default off.
@@ -91,13 +134,22 @@ int main(int argc, char* argv[]) {
         }
     }
     if (argc >= 3) {
-        char* end = nullptr;
-        unsigned long p = std::strtoul(argv[2], &end, 10);
-        if (end == argv[2] || *end != '\0' || p == 0 || p > 65535) {
-            std::cerr << "Invalid port: " << argv[2] << std::endl;
-            return 1;
+        // port may be positional #2 (skip switches)
+        int positional = 0;
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg.rfind("--", 0) == 0) continue;
+            ++positional;
+            if (positional == 2) {
+                char* end = nullptr;
+                unsigned long p = std::strtoul(arg.c_str(), &end, 10);
+                if (end == arg.c_str() || *end != '\0' || p == 0 || p > 65535) {
+                    std::cerr << "Invalid port: " << arg << std::endl;
+                    return 1;
+                }
+                port = static_cast<uint16_t>(p);
+            }
         }
-        port = static_cast<uint16_t>(p);
     }
 
     std::cout << "======================================" << std::endl;
@@ -122,6 +174,24 @@ int main(int argc, char* argv[]) {
         }
         renderer.SetFaultInjectStage(faultStage);
         std::cout << "[Audio] Fault injection enabled: render stage '" << faultStage << "'" << std::endl;
+    }
+
+    // ---- T-GPU-AUDIO-GLITCH F4 (FR-05)：装配水位参数（在 SetRingBuffer 之后、
+    //      Initialize 之前；样本口径 = 交织样本，与 RingBuffer 槽位一致）----
+    {
+        const size_t startSamples = static_cast<size_t>(startWaterMs) * 48000 / 1000 * 2;
+        const size_t resumeSamples = startSamples * 3 / 4;   // 0.75×start（滞回）
+        const size_t fadeSamples = 48000 * 5 / 1000 * 2;     // 5ms（每声道 240 帧）
+        renderer.SetWaterLevels(startSamples, resumeSamples, fadeSamples);
+        if (!dumpPcmPath.empty()) {
+            renderer.SetDumpPcmPath(dumpPcmPath);
+        }
+        std::cout << "[Audio] Water levels: start=" << startWaterMs << "ms ("
+                  << startSamples << " samples), resume=" << (startWaterMs * 3 / 4)
+                  << "ms (" << resumeSamples << " samples), fade=5ms" << std::endl;
+        if (!dumpPcmPath.empty()) {
+            std::cout << "[Audio] dump-pcm enabled: " << dumpPcmPath << std::endl;
+        }
     }
 
     // B11 (M-6): stall handler runs on the IO thread; only flag-setting /

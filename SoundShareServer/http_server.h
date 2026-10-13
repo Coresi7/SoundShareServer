@@ -218,6 +218,17 @@ public:
     // m_sessions 数量（日志辅助；内部取 L1，勿在持锁时调用）
     size_t SessionCount() const;
 
+    // ---- T-GPU-AUDIO-GLITCH S0 (F6)：观测端点（DIAGNOSTICS 宏内）----
+    // GET /_debug/stats/reset（D-11A 主通道：复位采集观测窗口直方图）
+    void SetStatsResetHook(std::function<void()> hook) { m_statsResetHook = std::move(hook); }
+    void ResetStatsWindow();   // 调 m_statsResetHook（未注册则 no-op）
+    // GET /_debug/capture/hist?name=interArrival|callbackCritical（D-18A：Q2 双峰
+    // 判读证据；返回完整 JSON body 或 {"error":...}）
+    void SetCaptureHistHook(std::function<std::string(const std::string&)> hook) {
+        m_captureHistHook = std::move(hook);
+    }
+    std::string CaptureHist(const std::string& name);
+
     ssl::context& GetSslContext() { return m_sslCtx; }
 
 private:
@@ -251,4 +262,8 @@ private:
     std::atomic<uint64_t> m_writeStalls{0};     // 写看门狗命中次数
     std::atomic<int64_t>  m_liveSessions{0};    // 构造++/析构--（R-12 兜底）
     std::atomic<bool>     m_stopped{false};     // Stop() 幂等闸门（A22 步骤 0）
+
+    // ---- T-GPU-AUDIO-GLITCH S0 (F6)：观测端点 hooks ----
+    std::function<void()> m_statsResetHook;                        // /_debug/stats/reset
+    std::function<std::string(const std::string&)> m_captureHistHook;  // /_debug/capture/hist
 };

@@ -63,10 +63,65 @@ static void HandleHttpRequest(
 {
     auto target = std::string(req.target());
 
+    // T-A1（tester 返修轮 1）：req.target() 含 query 串（如 "/?fallback=1"）。
+    // 路由匹配一律基于剥离 query 后的 path 部分（P0-3 同款思路的根因修法）；
+    // query 参数（fault/set 的 key/value、hist 的 name）仍从完整 target 解析。
+    std::string path = target;
+    const auto qmark = target.find('?');
+    if (qmark != std::string::npos) path.resize(qmark);
+
 #ifdef SOUNDSHARE_ENABLE_DIAGNOSTICS
     // 探针入口 1（主）：只读会话/写入状态（FR-10；O(1) 按需，零周期输出）
-    if (target == "/_debug/sessions") {
+    // T-A1：改用剥离 query 后的 path 精确匹配（原 target 精确相等在带 query
+    // 时 404，与根路由同款缺陷；不带 query 行为不变）。
+    if (path == "/_debug/sessions") {
         auto body = server->DumpProbeJson();
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::server, "SoundShareServer");
+        res.set(http::field::content_type, "application/json");
+        res.set(http::field::access_control_allow_origin, "*");
+        res.keep_alive(req.keep_alive());
+        res.body() = std::move(body);
+        res.prepare_payload();
+        sendResponse(std::move(res));
+        return;
+    }
+
+    // T-GPU-AUDIO-GLITCH S0 (F6 / D-11A)：采集观测窗口复位（只读诊断动作）。
+    // ★ P1-1：本路由为主通道（DIAGNOSTICS 默认 ON）；注入构建的
+    //   /_debug/fault/set?key=stats_reset 为兜底。
+    if (target.rfind("/_debug/stats/reset", 0) == 0) {
+        server->ResetStatsWindow();
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::server, "SoundShareServer");
+        res.set(http::field::content_type, "application/json");
+        res.set(http::field::access_control_allow_origin, "*");
+        res.keep_alive(req.keep_alive());
+        res.body() = "{\"ok\":true,\"action\":\"stats_reset\"}";
+        res.prepare_payload();
+        sendResponse(std::move(res));
+        return;
+    }
+
+    // T-GPU-AUDIO-GLITCH S0 (F6 / D-18A)：采集直方图导出（Q2 双峰判读证据）。
+    // ★ P0-3：必须前缀匹配（req.target() 含 query 串，精确相等会 404 ⇒ Q2 无
+    //   证据）；name 参数自解析（默认 interArrival），与 /_debug/fault/set 同款。
+    if (target.rfind("/_debug/capture/hist", 0) == 0) {
+        std::string name = "interArrival";
+        auto qpos = target.find('?');
+        if (qpos != std::string::npos) {
+            const std::string query = target.substr(qpos + 1);
+            size_t pos = 0;
+            while (pos < query.size()) {
+                size_t amp = query.find('&', pos);
+                std::string seg = query.substr(pos, (amp == std::string::npos ? query.size() : amp) - pos);
+                pos = (amp == std::string::npos) ? query.size() : amp + 1;
+                auto eq = seg.find('=');
+                if (eq == std::string::npos) continue;
+                if (seg.substr(0, eq) == "name") name = seg.substr(eq + 1);
+            }
+        }
+        auto body = server->CaptureHist(name);
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.set(http::field::server, "SoundShareServer");
         res.set(http::field::content_type, "application/json");
@@ -103,7 +158,10 @@ static void HandleHttpRequest(
     }
 #endif
 
-    if (target == "/" || target == "/index.html") {
+    // T-A1：根路由改用剥离 query 后的 path 匹配 —— "/?fallback=1"（V-17 回退
+    // 冒烟入口）与 "/index.html?x=1" 之前因 target 含 query 精确相等而 404；
+    // 不带 query 的 "/" 与 "/index.html" 行为不变。
+    if (path == "/" || path == "/index.html") {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.set(http::field::server, "SoundShareServer");
         res.set(http::field::content_type, "text/html; charset=utf-8");
@@ -1231,6 +1289,16 @@ std::string HttpServer::DumpProbeJson() const {
     cfg.maxTextFrames = QueueConfig{}.maxTextFrames;
 
     return SerializeProbeJson(entries, extra, c, cfg);
+}
+
+// ---- T-GPU-AUDIO-GLITCH S0 (F6)：观测端点实现 ----
+void HttpServer::ResetStatsWindow() {
+    if (m_statsResetHook) m_statsResetHook();
+}
+
+std::string HttpServer::CaptureHist(const std::string& name) {
+    if (m_captureHistHook) return m_captureHistHook(name);
+    return "{\"error\":\"capture hist hook not registered\"}";
 }
 
 void HttpServer::BroadcastBinary(const void* data, size_t size) {

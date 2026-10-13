@@ -1,6 +1,10 @@
 #include "diagnostics.h"
 #include "write_queue.h"
 
+// T-GPU-AUDIO-GLITCH S0：inject_marker / force_capture_reinit / stats_reset
+// 三个 key 直接写进程级 g_captureStats（单向依赖，无环）
+#include "capture_stats.h"
+
 #include <cstdlib>
 
 // ============================================================
@@ -125,6 +129,63 @@ bool FaultInjection::Set(const std::string& key, const std::string& value,
         std::lock_guard<std::mutex> lk(m_mtx);
         if (on) m_pauseStreamSessions.insert(*sessionId);
         else    m_pauseStreamSessions.erase(*sessionId);
+        return true;
+    }
+
+    // ---- 采集侧注入开关（T-GPU-AUDIO-GLITCH NFR-TEST-1 级1/2 + C3 + 窗口复位）----
+    if (key == "capture_stall_ms") {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(value.c_str(), &end, 10);
+        if (end == value.c_str() || v > 500UL) {
+            error = "invalid capture_stall_ms (expected 0..500)";
+            return false;
+        }
+        m_captureStallMs.store(static_cast<uint32_t>(v), std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "capture_stall_prob_ppm") {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(value.c_str(), &end, 10);
+        if (end == value.c_str() || v > 1000000UL) {
+            error = "invalid capture_stall_prob_ppm (expected 0..1000000)";
+            return false;
+        }
+        m_captureStallProbPpm.store(static_cast<uint32_t>(v), std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "capture_batch_ms") {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(value.c_str(), &end, 10);
+        if (end == value.c_str() || v > 500UL) {
+            error = "invalid capture_batch_ms (expected 0..500)";
+            return false;
+        }
+        m_captureBatchMs.store(static_cast<uint32_t>(v), std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "capture_skip_packets") {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(value.c_str(), &end, 10);
+        if (end == value.c_str() || v > 1000000UL) {
+            error = "invalid capture_skip_packets (expected 0..1000000)";
+            return false;
+        }
+        m_captureSkipPackets.store(static_cast<uint32_t>(v), std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "inject_marker") {
+        // C3 (NFR-LAT-3)：一次性 arm；采集回调在 hasStreamingClients 早退之后消费
+        if (on) g_captureStats.markerArmed.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "force_capture_reinit") {
+        // AC-FR03 / V-04：一次性；采集循环消费后走真实 try_recovery
+        if (on) g_captureStats.reinitRequested.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "stats_reset") {
+        // P1-1：与 GET /_debug/stats/reset 路由等价的注入构建兜底通道（清窗口直方图）
+        if (on) g_captureStats.ResetWindow();
         return true;
     }
 

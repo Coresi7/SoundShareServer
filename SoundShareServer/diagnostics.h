@@ -115,6 +115,31 @@ public:
         return m_readMessageMax.load(std::memory_order_relaxed);
     }
 
+    // ---- 采集侧注入开关（T-GPU-AUDIO-GLITCH NFR-TEST-1 级1/2 + C3；默认全关）----
+    // 读检查点在 main.cpp 采集回调内（SOUNDSHARE_ENABLE_FAULT_INJECTION=OFF 时
+    // 编译剔除）；成员本身保留（探针 injection 段两种构建都可读，恒 0）。
+    uint32_t CaptureStallMs() const {
+        return m_captureStallMs.load(std::memory_order_relaxed);
+    }
+    uint32_t CaptureStallProbPpm() const {
+        return m_captureStallProbPpm.load(std::memory_order_relaxed);
+    }
+    uint32_t CaptureBatchMs() const {
+        return m_captureBatchMs.load(std::memory_order_relaxed);
+    }
+    uint32_t CaptureSkipPackets() const {
+        return m_captureSkipPackets.load(std::memory_order_relaxed);
+    }
+    // capture_skip_packets 一次性计数语义：原子递减；返回 true = 本 packet 丢弃内容
+    // （仍正常 ReleaseBuffer ⇒ 不产生 DATA_DISCONTINUITY；P1-4 语义边界）
+    bool ConsumeCaptureSkipPacket() {
+        uint32_t v = m_captureSkipPackets.load(std::memory_order_relaxed);
+        while (v > 0 &&
+               !m_captureSkipPackets.compare_exchange_weak(
+                   v, v - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+        return v > 0;
+    }
+
     // ---- 写端点 /_debug/fault/set?key=..&value=..[&session=N] ----
     // session 参数为会话序号（M-7，非指针）。返回 false 时 error 给出原因。
     bool Set(const std::string& key, const std::string& value,
@@ -134,6 +159,12 @@ private:
     std::set<uint64_t> m_injectWriteErrorSessions;
     std::set<uint64_t> m_injectReadErrorSessions;
     std::set<uint64_t> m_pauseStreamSessions;
+
+    // 采集侧注入开关（全局，无 session 维度；默认全关）
+    std::atomic<uint32_t> m_captureStallMs{0};        // 0..500
+    std::atomic<uint32_t> m_captureStallProbPpm{0};   // 0..1000000
+    std::atomic<uint32_t> m_captureBatchMs{0};        // 0..500
+    std::atomic<uint32_t> m_captureSkipPackets{0};    // 一次性计数（逐 packet 递减）
 };
 
 // ---- M-7: 会话序号（进程内单调递增 uint64，不输出指针地址）----

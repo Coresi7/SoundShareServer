@@ -155,6 +155,8 @@
     <ClInclude Include="write_queue.h" />
 
     <ClInclude Include="embedded_page.h" />
+    <!-- T-GPU-AUDIO-GLITCH S0 (F6): header-only capture observation (s4: IDE listing only) -->
+    <ClInclude Include="capture_stats.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

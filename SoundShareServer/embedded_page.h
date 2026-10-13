@@ -3,6 +3,12 @@
 // Embedded HTML page served to browsers
 // Receives raw PCM Int16 audio over WebSocket and plays via AudioContext
 // This approach has maximum browser compatibility (raw PCM over WebSocket)
+//
+// NOTE (T-GPU-AUDIO-GLITCH F4): this page is served as TWO adjacent raw
+// string literals concatenated by the compiler. The F4 state-machine change
+// pushed the single literal past the MSVC raw-string limit (~16KB, error
+// C2026 "string too big"); the split below is byte-identical to a single
+// literal (adjacent literals concatenate with no inserted characters).
 
 inline const char* GetIndexHtml() {
     return R"HTML(<!DOCTYPE html>
@@ -86,11 +92,26 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         // Ring buffer: 48000 * 2ch * 4bytes * 2sec = ~768KB, plenty of room
-        this.bufferSize = 48000 * 2 * 2; // 2 seconds worth of samples (interleaved)
+        this.bufferSize = 48000 * 2 * 2; // 2 seconds worth of samples (interleaved) -- capacityCap, DO NOT raise
         this.ringBuffer = new Float32Array(this.bufferSize);
         this.writePos = 0;
         this.readPos = 0;
         this.count = 0; // number of samples available
+
+        // ---- T-GPU-AUDIO-GLITCH F4 (FR-04): watermark + soft-underrun state machine ----
+        // Units: interleaved samples (same scale as this.count). Single parameter
+        // family (NFR-LAT-2): start 80ms / resume 60ms (0.75x start, hysteresis) /
+        // fade 5ms (240 frames per channel). 2s capacity above stays untouched.
+        this.startSamples = 48000 * 0.080 * 2;   // 7680  (startWaterLevel)
+        this.resumeSamples = 48000 * 0.060 * 2;  // 5760  (resumeWaterLevel = 0.75 x start)
+        this.fadeSamples = 48000 * 0.005 * 2;    // 480   (5ms; envelope step = 1/240 per frame)
+        this.state = 'PREFILL';
+        this.env = 0;                 // 0..1 envelope, per-frame ramped (m3)
+        this.underrunCount = 0;       // U: number of entries into SOFT_UNDERRUN
+        this.availMin = Infinity;     // m5: updated only outside PREFILL
+        this.lastL = 0; this.lastR = 0;   // m3: updated ONLY in the normal-read branch
+        this.everStarted = false;     // after first start, resume at resumeSamples
+        this.statsTick = 0;
 
         this.port.onmessage = (e) => {
             if (e.data.type === 'audio') {
@@ -111,6 +132,10 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 this.writePos = 0;
                 this.readPos = 0;
                 this.count = 0;
+                // F4: reset the state machine on clear (stop/reconnect); keep
+                // underrunCount/availMin as session-window observations.
+                this.state = 'PREFILL';
+                this.env = 0;
             }
         };
     }
@@ -119,29 +144,84 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         const output = outputs[0];
         const numChannels = output.length; // typically 2
         const frameCount = output[0].length; // typically 128
-        const needed = frameCount * 2; // interleaved stereo samples needed
+        const need = frameCount * 2; // interleaved stereo samples needed
+        const avail = this.count;
+        // m3: per-FRAME envelope step = 1 / (fadeSamples / 2) = 1/240 (5ms @48k)
+        const step = 1 / (this.fadeSamples / 2);
 
-        if (this.count >= needed) {
+        if (this.state === 'PREFILL') {
+            const w = this.everStarted ? this.resumeSamples : this.startSamples;
+            if (avail < w) {
+                // Not started yet: output silence (this is "not begun", not a hard cut)
+                for (let ch = 0; ch < numChannels; ch++) output[ch].fill(0);
+                this.env = 0;
+                return true;
+            }
+            this.state = 'PLAYING';
+            this.everStarted = true;
+        }
+
+        let normal = false;
+        if (avail >= need) {
+            // Normal read -- the ONLY branch that updates lastL/lastR (m3)
             for (let i = 0; i < frameCount; i++) {
-                // Read interleaved L, R
                 const l = this.ringBuffer[this.readPos];
                 this.readPos = (this.readPos + 1) % this.bufferSize;
                 const r = this.ringBuffer[this.readPos];
                 this.readPos = (this.readPos + 1) % this.bufferSize;
-
-                if (numChannels >= 2) {
-                    output[0][i] = l;
-                    output[1][i] = r;
-                } else {
-                    output[0][i] = (l + r) * 0.5;
-                }
+                if (numChannels >= 2) { output[0][i] = l; output[1][i] = r; }
+                else { output[0][i] = (l + r) * 0.5; }
+                this.lastL = l; this.lastR = r;
             }
-            this.count -= needed;
+            this.count -= need;
+            if (this.state === 'PLAYING') normal = true;
         } else {
-            // Underrun: output silence
-            for (let ch = 0; ch < numChannels; ch++) {
-                output[ch].fill(0);
+            // Soft underrun: HOLD the last samples -- NO fill(0) hard cut (FR-04).
+            // lastL/lastR are NOT updated here (updating would degrade
+            // "hold last" into "hold 0" since env -> 0, m3).
+            if (this.state === 'PLAYING') {
+                this.state = 'SOFT_UNDERRUN';
+                this.underrunCount++;
             }
+            for (let i = 0; i < frameCount; i++) {
+                if (numChannels >= 2) { output[0][i] = this.lastL; output[1][i] = this.lastR; }
+                else { output[0][i] = (this.lastL + this.lastR) * 0.5; }
+            }
+        }
+
+        // *** P0-1: SOFT_UNDERRUN -> PREFILL migration MUST live OUTSIDE the
+        // avail<need else-branch, evaluated unconditionally after the branch
+        // (mirrors the native side). Inside the else it would require
+        // avail >= resumeSamples while avail < need(256) -- unreachable, and
+        // one underrun would silence the player forever. ***
+        if (this.state === 'SOFT_UNDERRUN' && this.env <= 0 && avail >= this.resumeSamples) {
+            this.state = 'PREFILL';
+        }
+
+        // m3: per-frame linear envelope ramp within the block (a single
+        // block-wide gain would leave 0.53x-magnitude steps every 2.67ms)
+        const target = normal ? 1 : 0;
+        for (let i = 0; i < frameCount; i++) {
+            this.env = (target > this.env) ? Math.min(target, this.env + step)
+                                           : Math.max(target, this.env - step);
+            output[0][i] *= this.env;
+            if (numChannels > 1) output[1][i] *= this.env;
+        }
+
+        // m5: availability minimum only outside PREFILL (a 0 during prefill
+        // would pin the floor to 0 forever)
+        if (this.state !== 'PREFILL') {
+            this.availMin = Math.min(this.availMin, this.count);
+        }
+
+        // F4 observability (AC-FR04): stats message every 512 process() calls
+        // (~1.4s at the 128-frame quantum)
+        if ((++this.statsTick & 511) === 0) {
+            this.port.postMessage({ type: 'stats',
+                                    underrunCount: this.underrunCount,
+                                    availMin: this.availMin,
+                                    availNow: this.count,
+                                    state: this.state });
         }
         return true;
     }
@@ -149,6 +229,8 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
 registerProcessor('pcm-player-processor', PCMPlayerProcessor);
 `;
 
+)HTML"
+R"HTML(
 let ws = null;
 let audioCtx = null;
 let gainNode = null;
@@ -162,6 +244,11 @@ let lastPcmAt = 0;
 let pcmArmed = false;
 let stallTimer = null;
 const BROWSER_STALL_MS = 15000;   // T_browser_stall (SS11-1)
+/* T-GPU-AUDIO-GLITCH F4 (FR-04): player stats (underrunCount / availMin) --
+   filled from worklet stats messages; readable via window.__playerStats,
+   #streamInfo text and the throttled console.log (AC-FR04 observability). */
+let fmtText = '';
+let lastStatsLogAt = 0;
 
 function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -218,8 +305,8 @@ function connect() {
                     sampleRate = msg.sampleRate || 48000;
                     channels = msg.channels || 2;
                     console.log('[Config] sampleRate=' + sampleRate + ' channels=' + channels);
-                    document.getElementById('streamInfo').textContent =
-                        'Format: ' + sampleRate + ' Hz, ' + channels + 'ch, PCM16';
+                    fmtText = 'Format: ' + sampleRate + ' Hz, ' + channels + 'ch, PCM16';
+                    document.getElementById('streamInfo').textContent = fmtText;
                 }
             } catch(e) {}
         } else if (evt.data instanceof ArrayBuffer && isStreaming) {
@@ -289,7 +376,13 @@ function handlePCMData(arrayBuffer) {
 async function startAudio() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+    // F4 test hook (02-design.md §3.4.4 / V-17): ?fallback=1 forces the
+    // ScriptProcessorNode fallback path (regression smoke for N8).
+    const forceFallback = new URLSearchParams(location.search).get('fallback') === '1';
+
     try {
+        if (forceFallback) throw new Error('fallback=1 forced (test hook)');
+
         audioCtx = new AudioContext({ sampleRate: sampleRate });
         if (audioCtx.state === 'suspended') {
             await audioCtx.resume();
@@ -311,6 +404,27 @@ async function startAudio() {
             numberOfOutputs: 1,
         });
         workletNode.connect(gainNode);
+
+        // F4 (FR-04 observability): worklet stats handler (registered only when
+        // workletNode exists; the ScriptProcessorNode fallback never reaches here)
+        workletNode.port.onmessage = (e) => {
+            if (!e.data || e.data.type !== 'stats') return;
+            window.__playerStats = e.data;
+            const bufMs = (sampleRate && channels)
+                ? Math.round(e.data.availNow / (sampleRate * channels) * 1000) : 0;
+            const info = document.getElementById('streamInfo');
+            if (info) {
+                info.textContent = (fmtText ? fmtText + ' | ' : '') +
+                    'Underruns: ' + e.data.underrunCount +
+                    ' | buf: ' + bufMs + ' ms' +
+                    ' | state: ' + e.data.state;
+            }
+            const now = performance.now();
+            if (now - lastStatsLogAt >= 5000) {   // 5s throttled console log
+                console.log('[Audio][STATS]', e.data);
+                lastStatsLogAt = now;
+            }
+        };
 
         console.log('[Audio] AudioWorklet initialized');
     } catch(e) {
@@ -394,6 +508,9 @@ function stopAudio() {
         ws.send(JSON.stringify({ type: 'stop' }));
     }
     if (workletNode) {
+        // F4: clear the stats handler and the stats themselves (no residue)
+        workletNode.port.onmessage = null;
+        try { delete window.__playerStats; } catch (err) { window.__playerStats = undefined; }
         workletNode.port.postMessage({ type: 'clear' });
         workletNode.disconnect();
         workletNode = null;
