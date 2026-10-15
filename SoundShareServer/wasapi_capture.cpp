@@ -36,6 +36,15 @@ std::string WideToUtf8(const std::wstring& w) {
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0], need, nullptr, nullptr);
     return out;
 }
+
+// FR-01（T-CAPTURE-IDLE-LOG §3.1.1 / Q4 / s4）：连续「未取得数据」唤醒阈值 = 10 次。
+// 推导：10 × 200ms(kCaptureEventTimeoutMs) = 2000ms = 2.0s。G-10 补注：该 2.0s 仅在
+//       唤醒间隔 = 200ms（真实空闲 / 注入+无播放）时成立；活跃播放下事件按设备周期
+//       （~10ms）置位 ⇒ 10 次连续无数据 ≈ 100ms —— 本常量为计数制，不承诺墙钟 2.0s，
+//       AC-FR01-3 的零误判由"活跃期每次唤醒均有数据（含 SILENT 帧
+//       numFramesAvailable > 0 ⇒ windowFrames > 0 ⇒ idleStreak 恒 0）"保障。
+//       编译期常数（s4：不做运行时旋钮，避免判据漂移）。
+constexpr uint32_t kIdleConsecutiveNoData = 10;
 } // namespace
 
 WasapiCapture::WasapiCapture() {}
@@ -481,19 +490,39 @@ void WasapiCapture::CaptureThread() {
     //   上一窗口，不代表本窗口到达分布）。
     uint64_t lastArrivalEpoch = g_captureStats.arrivalEpoch.load(std::memory_order_relaxed);
     uint64_t timeoutLogCounter = 0;   // m2：超时节流日志计数
+    // ---- FR-01（T-CAPTURE-IDLE-LOG §3.1.1）：本地 idle 状态（采集线程独占，无锁、
+    //      无新临界区；NFR-4）。与 timeoutLogCounter 同构：线程重建（reinit）时随局部
+    //      变量归零（O-1 / O-D2 登记备查，不影响不等式 (b)）。----
+    uint32_t idleStreak       = 0;    // 连续「未取得数据」唤醒数（m4：含 WAIT_TIMEOUT 与"事件置位但 0 帧"）
+    bool     idleActive       = false;  // 已判定 idle ⇒ 静默区间（FR-01 静默生效）
+    uint64_t idleStartUs      = 0;    // 本 episode 首次无数据唤醒时刻（idleMs 起算点，m1）
+    uint64_t idleClosedMs     = 0;    // 已结束 episode 累计空闲 ms（进程级；ResetWindow 够不到 ⇒ P0-3 单调）
+    uint64_t idleTimeoutCount = 0;    // 本 episode 内 WAIT_TIMEOUT 次数（恢复行 timeouts 字段）
 
     while (m_capturing.load()) {
         // ---- F3 (FR-03)：事件驱动等待；降级路径 = Sleep 轮询（行为与现状一致）----
+        // G-9：本唤醒是否走事件驱动路径（下方 if 分支置 true；降级 Sleep 的 else
+        //      分支保持 false ⇒ 永不进入 idle、永不打汇总行，m5 / NFR-1）。
+        bool eventPathWake = false;
         if (m_captureEvent && g_captureStats.eventDriven.load(std::memory_order_relaxed)) {
+            eventPathWake = true;
             DWORD wr = WaitForSingleObject(m_captureEvent, kCaptureEventTimeoutMs);
             if (!m_capturing.load()) break;   // Stop() 已置位 + SetEvent
             g_captureStats.eventWakeTotal.fetch_add(1, std::memory_order_relaxed);
             if (wr == WAIT_TIMEOUT) {
                 // m2：超时计数进探针（识别"SetEventHandle 成功但事件从不触发"）
                 g_captureStats.eventTimeoutTotal.fetch_add(1, std::memory_order_relaxed);
+                // FR-01：本 episode 内超时计数（恢复行 timeouts 字段）；既有两计数
+                // （eventTimeoutTotal/eventWakeTotal）语义不动（§3.0(c)）。
+                ++idleTimeoutCount;
+                // ★ G-11 / P1-1：计数【照常递增】，与 baseline 同一计数序列、绝不短路
+                //   （使不等式 (b)「任意窗 ≤ ⌈窗内超时次数/50⌉」严格可复算）；
+                //   idleActive 仅压制 std::cerr 输出（FR-01 静默，AC-FR01-1②）。
                 if (++timeoutLogCounter % 50 == 1) {
-                    std::cerr << "[WASAPI] Capture event timeout #" << timeoutLogCounter
-                              << " (continuing with defensive drain)" << std::endl;
+                    if (!idleActive) {
+                        std::cerr << "[WASAPI] Capture event timeout #" << timeoutLogCounter
+                                  << " (continuing with defensive drain)" << std::endl;
+                    }
                 }
                 // 仍走一次防御性 drain（下方公共 drain 路径）
             }
@@ -505,11 +534,27 @@ void WasapiCapture::CaptureThread() {
         uint32_t windowFrames = 0;            // F6：本次唤醒取得的帧数（同次唤醒多 packet 记一个样本）
 
         UINT32 packetLength = 0;
-        HRESULT hr = m_captureClient->GetNextPacketSize(&packetLength);
-        if (FAILED(hr)) {
-            std::cerr << "[WASAPI] GetNextPacketSize failed: 0x" << std::hex << hr << std::dec
-                      << " (" << HrToString(hr) << ")" << std::endl;
-            goto try_recovery;
+        HRESULT hr = S_OK;
+#ifdef SOUNDSHARE_ENABLE_FAULT_INJECTION
+        // ---- T-CAPTURE-IDLE-LOG §3.4.3：capture_idle_sim 检查点 ----
+        // 置 1 ⇒ 跳过本次取数 drain（GetNextPacketSize/GetBuffer/ReleaseBuffer 全
+        // 不调用）⇒ packetLength 恒 0 ⇒ while 循环不进 ⇒ windowFrames 恒 0 ⇒
+        // 与端点空闲等价。
+        // (a) 不短路 WaitForSingleObject（仍在上方事件分支内等待，§3.0(a)）；
+        // (c) eventWakeTotal / eventTimeoutTotal 已在上方照常累加，此处不触碰。
+        // G-13：if (!idleSim) 只包裹 GetNextPacketSize 首调用；drain 循环体与
+        // goto try_recovery 逐字不动（仅多嵌一层，属“跳出作用域”，C++ 合法）。
+        const bool idleSim = g_captureStats.captureIdleSim.load(std::memory_order_relaxed);
+#else
+        constexpr bool idleSim = false;   // OFF 构建：检查点编译剔除，正常路径零开销
+#endif
+        if (!idleSim) {
+            hr = m_captureClient->GetNextPacketSize(&packetLength);
+            if (FAILED(hr)) {
+                std::cerr << "[WASAPI] GetNextPacketSize failed: 0x" << std::hex << hr << std::dec
+                          << " (" << HrToString(hr) << ")" << std::endl;
+                goto try_recovery;
+            }
         }
 
         while (packetLength > 0) {
@@ -572,18 +617,71 @@ void WasapiCapture::CaptureThread() {
             }
         }
 
+        // ---- FR-01（T-CAPTURE-IDLE-LOG §3.1.2）：idle 记账（块 D）+ FR-03 F6 打点，
+        //      同置于一层作用域内（实现说明：goto try_recovery 的源点位于本块【之前】
+        //      的 FAILED 分支、目标标签位于本块【之后】的同层位置；若 gotData/
+        //      exitedIdle 裸露在同层作用域，goto 将"跳过初始化"⇒ MSVC C2362。
+        //      包一层作用域后 goto 属"跳出作用域"，C++ 合法；逻辑逐字不变）。----
+        {
+        const bool gotData = (windowFrames > 0);
+        // ★ G-12：exitedIdle 必须在下方状态重置【之前】取样（FR-03 消费；与
+        //   ResetWindow() 的窗口复位无关，勿混淆 —— ResetWindow 只清探针侧
+        //   lastIdleMs/currentIdleMs 两个快照量，够不到本函数局部状态）。
+        const bool exitedIdle = idleActive && gotData;
+        if (!gotData && eventPathWake) {   // 仅事件驱动路径（m5：降级 Sleep 路径不计 idle）
+            if (idleStreak == 0) idleStartUs = wakeUs;   // m1：自本 episode 首次无数据唤醒起算
+            ++idleStreak;
+            const uint64_t curMs = (wakeUs - idleStartUs) / 1000;   // QpcNowUs 为 µs ⇒ ÷1000 = ms（非 ÷10000）
+            if (!idleActive && idleStreak >= kIdleConsecutiveNoData) {
+                idleActive = true;   // 进入静默区间：此后 timeout 行 0 输出（计数照常，G-11）
+                g_captureStats.idleEpisodes.fetch_add(1, std::memory_order_relaxed);   // 进入时 +1（m15，进程级单调 P0-3）
+            }
+            if (idleActive) {
+                g_captureStats.currentIdleMs.store(curMs, std::memory_order_relaxed);
+                g_captureStats.totalIdleMs.store(idleClosedMs + curMs, std::memory_order_relaxed);
+            }
+        } else if (gotData) {
+            if (idleActive) {
+                const uint64_t epMs = (wakeUs - idleStartUs) / 1000;
+                idleClosedMs += epMs;   // 进程级累加（ResetWindow 够不到 ⇒ totalIdleMs 单调，P0-3）
+                g_captureStats.lastIdleMs.store(epMs, std::memory_order_relaxed);
+                g_captureStats.totalIdleMs.store(idleClosedMs, std::memory_order_relaxed);
+                g_captureStats.currentIdleMs.store(0, std::memory_order_relaxed);   // s5：非 idle 恒 0（tester 机器标记）
+                const uint64_t ep = g_captureStats.idleEpisodes.load(std::memory_order_relaxed);   // 1 基、进程级单调（m11）
+                // ★ G-10：std::endl 强制 flush（stdout 重定向到 pipe 为全缓冲，"\n"
+                //   不 flush ⇒ 测试采集不到行）；格式逐字固定（s2：禁止增删字段）。
+                std::cout << "[WASAPI] Capture idle ended: ep=" << ep << " idleMs=" << epMs
+                          << " totalIdleMs=" << idleClosedMs << " timeouts=" << idleTimeoutCount
+                          << std::endl;
+            }
+            idleStreak = 0; idleActive = false; idleStartUs = 0; idleTimeoutCount = 0;
+        }
+
         // F6 (FR-08)：到达间隔打点 —— 本次唤醒且取到数据 ⇒ 一个样本（§6.2 口径；
         // 不受 hasStreamingClients 影响；Sleep 轮询 / 事件驱动两种等待模式同一点打点）。
         // ★ S-2：epoch 变化（窗口 reset 落在两次唤醒之间）⇒ 丢弃该次跨边界间隔，
         //   以本次唤醒为新基准。
         if (windowFrames > 0) {
             const uint64_t epoch = g_captureStats.arrivalEpoch.load(std::memory_order_relaxed);
-            if (lastWakeUs != 0 && epoch == lastArrivalEpoch) {
+            if (exitedIdle) {
+                // ★ FR-03（T-CAPTURE-IDLE-LOG §3.3）：空闲退出首帧的间隔 = 整个空闲
+                //   时长，非到达抖动 ⇒ 不入直方图，仅重置基准。P1-4：必须【同时】
+                //   同步 lastArrivalEpoch，否则跨 reset 边界首样本仍污染 Max
+                //   （S-2 守卫失效）。
+                lastWakeUs = wakeUs;
+                lastArrivalEpoch = epoch;
+            } else if (lastWakeUs != 0 && epoch == lastArrivalEpoch) {
                 g_captureStats.interArrival.AddUs(wakeUs - lastWakeUs);
+                lastArrivalEpoch = epoch;
+                lastWakeUs = wakeUs;
+            } else {
+                // S-2 原分支：epoch 变化（窗口 reset 落在两次唤醒之间）⇒ 丢弃该次
+                // 跨边界间隔，以本次唤醒为新基准。
+                lastArrivalEpoch = epoch;
+                lastWakeUs = wakeUs;
             }
-            lastArrivalEpoch = epoch;
-            lastWakeUs = wakeUs;
         }
+        }   // ---- FR-01 块 D + FR-03 F6 打点 作用域结束（gotData/exitedIdle 生命周期）----
 
 #ifdef SOUNDSHARE_ENABLE_FAULT_INJECTION
         // NFR-TEST-1 (AC-FR03 / V-04)：force_capture_reinit 一次性触发 →

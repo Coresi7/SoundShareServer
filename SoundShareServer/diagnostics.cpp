@@ -173,6 +173,15 @@ bool FaultInjection::Set(const std::string& key, const std::string& value,
         m_captureSkipPackets.store(static_cast<uint32_t>(v), std::memory_order_relaxed);
         return true;
     }
+    if (key == "capture_idle_sim") {
+        // 持续型（s1，T-CAPTURE-IDLE-LOG §3.4.2）：value=1 置位 / value=0 解除。
+        // 语义：抑制取数 drain ⇒ 采集线程 windowFrames 恒 0 ⇒ 与端点空闲等价。
+        // 同时镜像到 g_captureStats（采集线程读取点；FaultInjection 是 HttpServer
+        // 成员、无单例 M-3，与 force_capture_reinit → reinitRequested 同模式）。
+        m_captureIdleSim.store(on ? 1u : 0u, std::memory_order_relaxed);
+        g_captureStats.captureIdleSim.store(on, std::memory_order_relaxed);
+        return true;
+    }
     if (key == "inject_marker") {
         // C3 (NFR-LAT-3)：一次性 arm；采集回调在 hasStreamingClients 早退之后消费
         if (on) g_captureStats.markerArmed.store(true, std::memory_order_relaxed);

@@ -486,6 +486,8 @@ int main(int argc, char* argv[]) {
         s += " \"captureInterArrivalMsP50\": " + Fixed2(cs.interArrival.QuantileMs(0.50)) + ",";
         s += " \"captureInterArrivalMsP99\": " + Fixed2(cs.interArrival.QuantileMs(0.99)) + ",";
         s += " \"captureInterArrivalMsMax\": " + Fixed2(static_cast<double>(cs.interArrival.maxUs.load(std::memory_order_relaxed)) / 1000.0) + ",";
+        // ★ m12（T-CAPTURE-IDLE-LOG FR-03）：自本任务起 captureInterArrivalSaturated
+        //   不再含空闲边界样本（空闲退出首帧由 wasapi_capture.cpp 跳过 AddUs）。
         s += " \"captureInterArrivalSamples\": " + std::to_string(cs.interArrival.count.load(std::memory_order_relaxed)) + ",";
         s += " \"captureInterArrivalSaturated\": " + std::to_string(cs.interArrival.saturated.load(std::memory_order_relaxed)) + ",";
         s += " \"captureCallbackCriticalMsP50\": " + Fixed2(cs.callbackCritical.QuantileMs(0.50)) + ",";
@@ -501,6 +503,12 @@ int main(int argc, char* argv[]) {
         s += " \"captureEventHandlesCreated\": " + std::to_string(cs.eventHandlesCreated.load(std::memory_order_relaxed)) + ",";
         s += " \"captureEventTimeouts\": " + std::to_string(cs.eventTimeoutTotal.load(std::memory_order_relaxed)) + ",";
         s += " \"captureEventWakes\": " + std::to_string(cs.eventWakeTotal.load(std::memory_order_relaxed)) + ",";
+        // --- FR-02（T-CAPTURE-IDLE-LOG §3.2.2）：空闲可观测 4 字段（单位 ms，
+        //     与 captureEventTimeouts/captureEventWakes 命名/位置/风格完全对齐）---
+        s += " \"captureIdleEpisodes\": " + std::to_string(cs.idleEpisodes.load(std::memory_order_relaxed)) + ",";   // 次；进程级单调
+        s += " \"captureLastIdleMs\": " + std::to_string(cs.lastIdleMs.load(std::memory_order_relaxed)) + ",";       // ms；最近结束 episode
+        s += " \"captureTotalIdleMs\": " + std::to_string(cs.totalIdleMs.load(std::memory_order_relaxed)) + ",";     // ms；进程启动累计（含进行中）
+        s += " \"captureCurrentIdleMs\": " + std::to_string(cs.currentIdleMs.load(std::memory_order_relaxed)) + ","; // ms；非 idle 恒 0
         s += " \"captureReinitCount\": " + std::to_string(cs.reinitCount.load(std::memory_order_relaxed)) + ",";
         // --- F7：端点（m8：转义后输出）---
         // ★ B-1（reviewer 返工）：DeviceFriendlyName() 现为持锁按值快照
@@ -516,7 +524,10 @@ int main(int argc, char* argv[]) {
         s += " \"injection\": { \"captureStallMs\": " + std::to_string(server->Faults().CaptureStallMs());
         s += ", \"captureStallProbPpm\": " + std::to_string(server->Faults().CaptureStallProbPpm());
         s += ", \"captureBatchMs\": " + std::to_string(server->Faults().CaptureBatchMs());
-        s += ", \"captureSkipPackets\": " + std::to_string(server->Faults().CaptureSkipPackets()) + " }";
+        s += ", \"captureSkipPackets\": " + std::to_string(server->Faults().CaptureSkipPackets());
+        // §3.0(e)（T-CAPTURE-IDLE-LOG）：capture_idle_sim 开关状态（两种构建都
+        // 输出；OFF 构建恒 0 —— 与既有 4 key 同模式）
+        s += ", \"captureIdleSim\": " + std::to_string(server->Faults().CaptureIdleSim()) + " }";
         return s;
     });
 

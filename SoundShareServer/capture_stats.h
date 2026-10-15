@@ -97,12 +97,24 @@ struct CaptureStats {
     std::atomic<uint64_t> eventHandlesCreated{0};  // ★ 硬门禁：重初始化不重建句柄 ⇒ 恒为 1
     std::atomic<uint64_t> eventTimeoutTotal{0};    // ★ m2：WaitForSingleObject 返回 WAIT_TIMEOUT 次数
     std::atomic<uint64_t> eventWakeTotal{0};       // 事件唤醒总次数（给 timeouts 提供分母）
+    // --- FR-02（T-CAPTURE-IDLE-LOG §3.2.1）：空闲可观测（单写者=采集线程，relaxed
+    //     原子，无新锁；沿上方 eventTimeoutTotal/eventWakeTotal 既有模式。S-6：C++
+    //     成员不带 capture 前缀 = 沿用 eventTimeoutTotal 命名族；JSON 侧字段带
+    //     capture 前缀，见 main.cpp）。---
+    std::atomic<uint64_t> idleEpisodes{0};    // 进程级单调：进入 idle 时 +1（不随 ResetWindow 清零，P0-3）
+    std::atomic<uint64_t> lastIdleMs{0};      // 快照：最近结束 episode 空闲时长 ms（随 ResetWindow 复位）
+    std::atomic<uint64_t> totalIdleMs{0};     // 进程级单调：累计空闲 ms（含进行中 episode；不复位，P0-3）
+    std::atomic<uint64_t> currentIdleMs{0};   // 快照：当前 episode 已持续 ms；非 idle 恒 0（随复位）
     std::atomic<uint64_t> reinitCount{0};
     std::atomic<bool>     endpointIsGpuAudio{false};
     // --- C3 标记注入 ---
     std::atomic<bool>     markerArmed{false};
     std::atomic<uint64_t> markerSeq{0}, markerT0QpcUs{0};
     std::atomic<bool>     reinitRequested{false};  // force_capture_reinit 镜像
+    // capture_idle_sim 镜像（T-CAPTURE-IDLE-LOG §3.4.1 / D-02 / M-3）：FaultInjection
+    // 是 HttpServer 成员、无单例 ⇒ 采集线程从本镜像原子读取（与 reinitRequested
+    // 同模式）。diagnostics.cpp Set() 写入，采集线程 wasapi_capture.cpp 检查点读取。
+    std::atomic<bool>     captureIdleSim{false};
     // --- F5（条件性）---
     std::atomic<uint64_t> workerQueueDrops{0};
 
@@ -113,6 +125,14 @@ struct CaptureStats {
         callbackCritical.Reset();
         // ★ S-2：递增 epoch —— 打点方据此丢弃跨 reset 边界的首个间隔样本
         arrivalEpoch.fetch_add(1, std::memory_order_relaxed);
+        // --- FR-02（T-CAPTURE-IDLE-LOG §3.2.4 / P0-3 / AC-FR02-3）：reset 语义二分 ---
+        lastIdleMs.store(0, std::memory_order_relaxed);     // 快照量 ⇒ 随窗口复位
+        currentIdleMs.store(0, std::memory_order_relaxed);  // 快照量 ⇒ 随窗口复位
+        // ★ P0-3：idleEpisodes / totalIdleMs 为进程级单调量 —— 此处【故意不复位】
+        //   （真值源 = 采集线程局部 idleClosedMs，本函数够不到 ⇒ 单调性不受影响）。
+        //   S-4 边界声明：totalIdleMs 的"进程级单调"以单次采集线程生命周期为界
+        //   （Stop()/Start() 重建线程 ⇒ 局部 idleClosedMs 归零）；本任务全部 AC 在
+        //   单次运行内判定，登记备查、非本任务回归。
     }
 };
 

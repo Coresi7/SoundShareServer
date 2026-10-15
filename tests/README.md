@@ -16,6 +16,7 @@
 | `probe.py` | T3 探针 | 轮询 `GET /_debug/sessions`；`--watch N` 持续采样；`--json` 原始输出 |
 | `stress_lifecycle.py` | §8.12 生命周期压测 | 4 并发会话（2 normal + 2 no-read）+ 连续 100 次"连接-start-3s-硬断"；断言 `liveSessions - sessions` 恒 0 |
 | `forward_forensics.py` | **前向取证装置（复核轮 B-01）** | 见下节"前向取证装置" |
+| `idle_log.py` | **T-CAPTURE-IDLE-LOG 主证据脚本（第 12 个测试，只增不减 11→12）** | `--tag baseline\|post\|s0v` × `--mode inject\|inject-idle(natural 别名)\|active`；内置 O-D1 三条反 vacuity 门禁 V-A1/V-A2/V-A3、G-1 W-A′ 语义（注入 ON + 无播放、自 spawn 起算 60s）、G-5 V-23 固化、G-7 启动污染防护（`loop_play` 先启）、G-8 `probe.py --assert-*` 链实跑、P1-2 观测顺序；stdout+stderr 双路合并行计数 |
 
 ## 构建前置（目录语义，复核轮 B-02 勘误后）
 
@@ -89,3 +90,26 @@ python tests/stress_lifecycle.py --port 8080 --rounds 100
 2. 所有脚本默认 `ping_interval=None, ping_timeout=None`：避免客户端在服务端
    写卡死后 ~t+40s 主动断开，与服务端 ~29s 判定产生 10s 竞态。
 3. 仅用应用层手段（websockets / HTTP），无 iptables/tc/netem（NFR-WIN-4）。
+
+## T-CAPTURE-IDLE-LOG 用法（idle_log.py，`build/` 为注入 ON 构建）
+
+```powershell
+# S0v（V-22/V-23，先于 baseline）：W-A′ 验证刷屏与 HEAD 一致 + 注入窗 timeout 实测固化
+python tests\idle_log.py --tag s0v --mode inject-idle --exe-bin build\Release\SoundShareServer.exe
+python tests\idle_log.py --tag s0v --mode inject     --exe-bin build\Release\SoundShareServer.exe
+
+# baseline（S0 二进制留存于 build_idle_s0\，evidence 落 docs\tasks\T-CAPTURE-IDLE-LOG\evidence）
+python tests\idle_log.py --tag baseline --mode inject-idle --exe-bin build_idle_s0\Release\SoundShareServer.exe
+python tests\idle_log.py --tag baseline --mode inject     --exe-bin build_idle_s0\Release\SoundShareServer.exe
+python tests\idle_log.py --tag baseline --mode active     --exe-bin build_idle_s0\Release\SoundShareServer.exe
+
+# post（实现完成后重编 build\）
+python tests\idle_log.py --tag post --mode inject-idle --exe-bin build\Release\SoundShareServer.exe
+python tests\idle_log.py --tag post --mode inject     --exe-bin build\Release\SoundShareServer.exe
+python tests\idle_log.py --tag post --mode active     --exe-bin build\Release\SoundShareServer.exe
+
+# probe.py 断言链（G-8；episode 结束后、stats_reset 之前）
+python tests\probe.py --port 8080 --assert-idle-episodes-ge 1 --assert-last-idle-ms 55000,65000 --assert-total-idle-ms 55000,65000
+```
+
+测试总数：**12**（原 11 + `idle_log.py`，只增不减）。

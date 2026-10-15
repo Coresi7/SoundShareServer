@@ -130,6 +130,12 @@ public:
     uint32_t CaptureSkipPackets() const {
         return m_captureSkipPackets.load(std::memory_order_relaxed);
     }
+    // capture_idle_sim（T-CAPTURE-IDLE-LOG §3.4.1）：持续型 0=关（默认）1=模拟
+    // 端点空闲（抑制取数 drain ⇒ windowFrames 恒 0）。仅注入构建可写；
+    // 成员两种构建都保留（探针 injection 段可读，OFF 恒 0）。
+    uint32_t CaptureIdleSim() const {
+        return m_captureIdleSim.load(std::memory_order_relaxed);
+    }
     // capture_skip_packets 一次性计数语义：原子递减；返回 true = 本 packet 丢弃内容
     // （仍正常 ReleaseBuffer ⇒ 不产生 DATA_DISCONTINUITY；P1-4 语义边界）
     bool ConsumeCaptureSkipPacket() {
@@ -165,6 +171,7 @@ private:
     std::atomic<uint32_t> m_captureStallProbPpm{0};   // 0..1000000
     std::atomic<uint32_t> m_captureBatchMs{0};        // 0..500
     std::atomic<uint32_t> m_captureSkipPackets{0};    // 一次性计数（逐 packet 递减）
+    std::atomic<uint32_t> m_captureIdleSim{0};        // 持续型：0=关（默认）1=模拟端点空闲
 };
 
 // ---- M-7: 会话序号（进程内单调递增 uint64，不输出指针地址）----

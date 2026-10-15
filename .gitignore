@@ -23,6 +23,8 @@
 x64/
 x86/
 [Bb]uild/
+# CMake build dirs (build_baseline / build_off / build_review_on / build_idle_s0)
+build_*/
 [Oo]ut/
 [Bb]in/
 [Ll]ib/
