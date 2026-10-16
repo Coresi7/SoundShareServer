@@ -32,6 +32,36 @@ static void HoldLast(int16_t* buf, size_t got, size_t needed, uint16_t channels,
     }
 }
 
+// ---- T-CLIENT-SILENT-ON-RESUME：三态名与恢复事件日志（FR-06/AC-02/AC-06）----
+// FR-06/AC-06：三态名（仅供单行日志；不新增类成员，不改 wasapi_render.h）
+static const char* StateName(RenderState s) {
+    switch (s) {
+    case RenderState::PREFILL:       return "PREFILL";
+    case RenderState::PLAYING:       return "PLAYING";
+    case RenderState::SOFT_UNDERRUN: return "SOFT_UNDERRUN";
+    }
+    return "UNKNOWN";
+}
+
+// NFR-06 / M-4（§3.4.4 R1，H-08）：恢复事件行 —— 两类迁移【各自独立】1s
+// 节流（s_lastTick[2]，slot 0 = SOFT_UNDERRUN->PREFILL，slot 1 =
+// PREFILL->PLAYING）⇒ 合计硬上界 ≤2 行/s、稳态 0 行/s；行尾 t= 与周期
+// STATS 同一 loopStartTick 时基（M-1③）。static 仅渲染线程访问（R-1 并发论证）。
+static void LogResume(const char* trans, size_t avail, uint64_t und,
+                      int slot, uint64_t loopStartTick) {
+    static uint64_t s_lastTick[2] = {0, 0};
+    const uint64_t now = GetTickCount64();
+    if (now - s_lastTick[slot] < 1000) return;
+    s_lastTick[slot] = now;
+    std::cout << "[Audio][RESUME] " << trans << " avail=" << avail
+              << " underruns=" << und
+              << " t=" << (now - loopStartTick) << "ms" << std::endl;
+}
+
+// M-5a（§3.4.4 R2，H-09）：STATS 窗口内出队前水位峰值。仅渲染线程写；
+// Stop() 读取时渲染线程已 join（wasapi_render.cpp:298-300）⇒ 无竞态、无新增锁。
+static size_t g_availPeak = 0;
+
 WasapiRender::WasapiRender() {}
 
 WasapiRender::~WasapiRender() {
@@ -300,11 +330,18 @@ void WasapiRender::Stop() {
     }
     m_running.store(false);
     // ---- F4：终值统计行（tester 可从 stdout 直接读 U 与谷值，V-09）----
+    // T-CLIENT-SILENT-ON-RESUME（落点 6 / H-09）：行尾追加 state=/env=/availPeak=
+    // （既有字段顺序与分隔符不动；渲染线程已 join ⇒ g_availPeak 读取无竞态）。
     {
         const size_t minAvail = m_minAvailable.load(std::memory_order_relaxed);
+        char envBuf[16];
+        std::snprintf(envBuf, sizeof envBuf, "%.3f", m_env);
         std::cout << "[Audio][STATS] final: underruns=" << m_underrunCount.load()
                   << " minAvail=" << (minAvail == SIZE_MAX ? -1 : static_cast<long long>(minAvail))
-                  << " samples" << std::endl;
+                  << " samples state=" << StateName(m_state)
+                  << " env=" << envBuf
+                  << " availPeak=" << g_availPeak << std::endl;
+        g_availPeak = 0;   // R5：打印后窗口复位
     }
     // ---- C1/s5：dump 落盘（join 之后无并发）----
     WriteDumpWav();
@@ -333,6 +370,9 @@ void WasapiRender::RenderLoop() {
     // F4：30s 节流统计（§3.5.4）
     uint64_t lastStatsTick = GetTickCount64();
     uint64_t lastUnderruns = m_underrunCount.load(std::memory_order_relaxed);
+    // T-CLIENT-SILENT-ON-RESUME（落点 2，M-1③）：循环起始时基 —— 周期 STATS
+    // 行 t= 与 [Audio][RESUME] 行 t= 的同一基准（C5 存活判据，§3.4.2）。
+    const uint64_t loopStartTick = GetTickCount64();
 
     while (!m_stopRequested.load()) {
         DWORD waitResult = WaitForSingleObject(event, 200);
@@ -358,9 +398,18 @@ void WasapiRender::RenderLoop() {
         // 的固定 128 帧假设；原生量子变长（最短 ~2.67ms、最长 20ms 可完成完整淡出）
         const double step = 1.0 / (static_cast<double>(m_fadeSamples) / 2.0);
 
+        // ★ T-CLIENT-SILENT-ON-RESUME（落点 3 / FR-02 / G-2 / H-04）：出队【前】
+        //   水位快照（对齐 embedded_page.h:148 `const avail = this.count`）。
+        //   逃逸判定（下方 SOFT_UNDERRUN 分支）与 PREFILL 水位判定均用它，
+        //   严禁回落到"出队之后"的 Available()（缺陷根因的一半）。
+        const size_t availTop = m_ringBuffer->Available();
+        if (availTop > g_availPeak) g_availPeak = availTop;   // M-5a（R3）
+
         if (m_state == RenderState::PREFILL) {
             const size_t w = m_everStarted ? m_resumeWaterSamples : m_startWaterSamples;
-            if (m_ringBuffer->Available() < w) {
+            // 落点 4：判定改用出队前快照 availTop（数值等价：PREFILL 期不 Pop，
+            // 快照点与判定点之间 Available() 只可能被生产者增大）。
+            if (availTop < w) {
                 // m4①：PREFILL 期【不 Pop】，但必须 ReleaseBuffer(n, 0)（喂静音）——
                 // 不得跳过释放（否则渲染引擎饿死、stall watchdog 误触发）。
                 // 起播前静音是"还没开始"，不是硬切。
@@ -372,6 +421,16 @@ void WasapiRender::RenderLoop() {
                 continue;
             }
             m_state = RenderState::PLAYING;
+            // ★ D-04（§3.4.4 R6 / H-07）：m_minAvailable 语义由"会话最小值"变为
+            //   "当前播放段谷值"（PREFILL→PLAYING 晋升点复位为 SIZE_MAX）——
+            //   为 AC-02 的"minAvail 回升 > 0"服务；首次起播为 no-op（Start() 已复位）。
+            m_minAvailable.store(SIZE_MAX, std::memory_order_relaxed);
+            // ★ 落点 4：非首次起播 ⇒ 这是一次"复播"（AC-02 的 PREFILL→PLAYING
+            //   证据行，slot 1；独立 1s 节流 ⇒ 不会吞掉同窗口的逃逸行）。
+            if (m_everStarted)
+                LogResume("PREFILL->PLAYING", availTop,
+                          m_underrunCount.load(std::memory_order_relaxed),
+                          1, loopStartTick);
             m_everStarted = true;
             m_started = true;   // m5：谷值统计起点（首次进入 PLAYING 之后）
         }
@@ -379,31 +438,48 @@ void WasapiRender::RenderLoop() {
         size_t got = 0;
         bool normal = false;
         {
-            got = m_ringBuffer->Pop(temp.data(), samplesNeeded);
-            if (got == samplesNeeded && m_state == RenderState::PLAYING) {
-                normal = true;
-                // ★ m3：lastL/lastR 仅在正常读取分支更新（本块最后一个完整帧）。
-                //   若在欠载分支也更新，"保持最后样本"会退化为"保持 0"。
-                if (channels == 2 && got >= 2) {
-                    m_lastL = temp[got - 2];
-                    m_lastR = temp[got - 1];
-                } else if (got >= 1) {
-                    m_lastL = m_lastR = temp[got - 1];
+            if (m_state == RenderState::SOFT_UNDERRUN) {
+                // ★ T-CLIENT-SILENT-ON-RESUME（落点 5 / FR-02 / G-2 / H-03）：
+                //   SOFT_UNDERRUN 累积窗口 —— 本量子【完全不出队】（got 恒 0），
+                //   缓冲以满入队速率 R 累积（5760/96000 = 60ms 必达水位，任意
+                //   prod−cons 关系下成立）；语义与既有 PREFILL 低水位分支同构
+                //   （:363-372）。本分支不得 continue/break —— 必须落到下方共享
+                //   尾部 ReleaseBuffer(:439)（§4.6 喂静音契约，H-05）。
+                if (availTop >= m_resumeWaterSamples && m_env <= 0.0) {
+                    // ★ FR-01：同连接自举逃逸（H-04：出队【前】availTop 判定，
+                    //   位于出队分支之外、之前；原"出队后 Available() ≥ 5760"
+                    //   的吸收态判定已删除 —— 等效门槛 7680 且低水位期每量子
+                    //   被清零 ⇒ 永不可达）。
+                    m_state = RenderState::PREFILL;
+                    LogResume("SOFT_UNDERRUN->PREFILL", availTop,
+                              m_underrunCount.load(std::memory_order_relaxed),
+                              0, loopStartTick);
                 }
+                // ★ G-4 / H-06：沿用 HoldLast + 逐帧包络斜坡（:409-420 共享尾部），
+                //   禁止 memset(0) 硬切（与 :399 同一函数、同一参数形状）。
+                HoldLast(temp.data(), 0, samplesNeeded, channels, m_lastL, m_lastR);
             } else {
-                if (m_state == RenderState::PLAYING) {
-                    m_state = RenderState::SOFT_UNDERRUN;
-                    m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                // ★ G-1 / H-02：PLAYING 分支 —— 逐字保留原出队行为（零改动）。
+                got = m_ringBuffer->Pop(temp.data(), samplesNeeded);
+                if (got == samplesNeeded && m_state == RenderState::PLAYING) {
+                    normal = true;
+                    // ★ m3：lastL/lastR 仅在正常读取分支更新（本块最后一个完整帧）。
+                    //   若在欠载分支也更新，"保持最后样本"会退化为"保持 0"。
+                    if (channels == 2 && got >= 2) {
+                        m_lastL = temp[got - 2];
+                        m_lastR = temp[got - 1];
+                    } else if (got >= 1) {
+                        m_lastL = m_lastR = temp[got - 1];
+                    }
+                } else {
+                    if (m_state == RenderState::PLAYING) {
+                        m_state = RenderState::SOFT_UNDERRUN;
+                        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    // ★ 软欠载：保持最后样本（got 之后的部分），不得 memset(0)
+                    HoldLast(temp.data(), got, samplesNeeded, channels, m_lastL, m_lastR);
                 }
-                // ★ 软欠载：保持最后样本（got 之后的部分），不得 memset(0)
-                HoldLast(temp.data(), got, samplesNeeded, channels, m_lastL, m_lastR);
             }
-        }
-        // ★ P0-1 同构：SOFT_UNDERRUN → PREFILL 迁移判定置于分支【之后】无条件判定
-        //   （与浏览器端写法对齐；欠载分支内判定会因 avail < need 恒不可达 ⇒ 永久静音）
-        if (m_state == RenderState::SOFT_UNDERRUN && m_env <= 0.0 &&
-            m_ringBuffer->Available() >= m_resumeWaterSamples) {
-            m_state = RenderState::PREFILL;
         }
 
         // m4②/m3：包络【逐帧】线性斜坡（消除整块单一增益的 2.67ms 台阶）；
@@ -441,17 +517,26 @@ void WasapiRender::RenderLoop() {
         if (FAILED(hr) || FaultHit(3)) { RecordExit(3, hr); break; }
 
         // ---- F4：30s 节流统计行（V-09：stdout 可读 U 与谷值）----
+        // T-CLIENT-SILENT-ON-RESUME（落点 6 / H-09）：行尾追加 state=/env=/t=/availPeak=
+        // （顺序与字段分隔符不动 ⇒ 既有解析脚本向后兼容；t= 为 C5 存活判据）。
         {
             const uint64_t now = GetTickCount64();
             if (now - lastStatsTick >= 30000) {
                 const uint64_t und = m_underrunCount.load(std::memory_order_relaxed);
                 const size_t minAvail = m_minAvailable.load(std::memory_order_relaxed);
+                char envBuf[16];
+                std::snprintf(envBuf, sizeof envBuf, "%.3f", m_env);
                 std::cout << "[Audio][STATS] underruns=" << und
                           << " (+" << (und - lastUnderruns) << ")"
                           << " minAvail=" << (minAvail == SIZE_MAX ? -1 : static_cast<long long>(minAvail))
-                          << " samples avail=" << m_ringBuffer->Available() << std::endl;
+                          << " samples avail=" << m_ringBuffer->Available()
+                          << " state=" << StateName(m_state)
+                          << " env=" << envBuf
+                          << " t=" << (now - loopStartTick) << "ms"
+                          << " availPeak=" << g_availPeak << std::endl;
                 lastStatsTick = now;
                 lastUnderruns = und;
+                g_availPeak = 0;   // R5：打印后窗口复位
             }
         }
     }

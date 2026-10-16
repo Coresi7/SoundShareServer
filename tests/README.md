@@ -17,6 +17,7 @@
 | `stress_lifecycle.py` | §8.12 生命周期压测 | 4 并发会话（2 normal + 2 no-read）+ 连续 100 次"连接-start-3s-硬断"；断言 `liveSessions - sessions` 恒 0 |
 | `forward_forensics.py` | **前向取证装置（复核轮 B-01）** | 见下节"前向取证装置" |
 | `idle_log.py` | **T-CAPTURE-IDLE-LOG 主证据脚本（第 12 个测试，只增不减 11→12）** | `--tag baseline\|post\|s0v` × `--mode inject\|inject-idle(natural 别名)\|active`；内置 O-D1 三条反 vacuity 门禁 V-A1/V-A2/V-A3、G-1 W-A′ 语义（注入 ON + 无播放、自 spawn 起算 60s）、G-5 V-23 固化、G-7 启动污染防护（`loop_play` 先启）、G-8 `probe.py --assert-*` 链实跑、P1-2 观测顺序；stdout+stderr 双路合并行计数 |
+| `resume/`（4 脚本） | **T-CLIENT-SILENT-ON-RESUME 主证据装置（第 13 个测试，只增不减 12→13）** | `resume_gap.py`：mock WS 音频服务端（1kHz/-3dBFS 实时节奏 × `--cycles/--gap/--mode/--gap-mode/--slow-rate/--hold/--stop-at-gap`；TCP_NODELAY + 绝对时间调度不追帧 + `burst_ge4_count` 反例 (a) 探测器）；`analyze_dump.py`：dump WAV RMS 包络/恢复沿/毛刺（§7.2.4 阶跃判据）；`run_matrix.py`：M1..M8 矩阵 harness（逐行墙钟 `timeline.json` + `evidence/<tag>/{timeline,metrics,manifest}.json` + V-01..V-08 判据 + `--v08-summary` 硬前置门禁）；`timestamp_stdout.py`：真机人工取证逐行墙钟包裹器（Ctrl+C 转发 + timeline 落盘） |
 
 ## 构建前置（目录语义，复核轮 B-02 勘误后）
 
@@ -112,4 +113,23 @@ python tests\idle_log.py --tag post --mode active     --exe-bin build\Release\So
 python tests\probe.py --port 8080 --assert-idle-episodes-ge 1 --assert-last-idle-ms 55000,65000 --assert-total-idle-ms 55000,65000
 ```
 
-测试总数：**12**（原 11 + `idle_log.py`，只增不减）。
+## T-CLIENT-SILENT-ON-RESUME 用法（resume/，详见 docs/tasks/T-CLIENT-SILENT-ON-RESUME/）
+
+```powershell
+# baseline（改前 HEAD 构建于 build_baseline_client\）→ post（build\）双跑矩阵：
+python tests\resume\run_matrix.py --ssc build_baseline_client\Release\SoundShareClient.exe --variant baseline --matrix M1 --tag M1-baseline
+python tests\resume\run_matrix.py --ssc build\Release\SoundShareClient.exe --variant post --matrix M2 --tag M2-post
+# ... M1..M8 同构（M3/M4 加 --m1-metrics 指向 M1 同变体 metrics.json 做 Δ 归一）
+
+# V-08 mock 取证有效性硬前置门禁（baseline 侧汇总）：
+python tests\resume\run_matrix.py --v08-summary --evidence docs\tasks\T-CLIENT-SILENT-ON-RESUME\evidence
+
+# 单独分析 dump：
+python tests\resume\analyze_dump.py <dump.wav> --glitch
+
+# 真机人工取证（复用同一墙钟口径）：
+python tests\resume\timestamp_stdout.py -- SoundShareClient.exe <ip> <port> --dump-pcm=C:\tmp\real.wav
+```
+
+测试总数：**13**（原 12 + `resume/`（第 13 个测试装置，4 脚本），只增不减）。
+
